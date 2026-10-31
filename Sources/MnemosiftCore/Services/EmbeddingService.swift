@@ -1,0 +1,226 @@
+import Foundation
+import Observation
+
+/// 仕様書 §3.5 & §11.3: Embedding・検索インデックス管理サービス
+/// - ファイル登録・変更、文字起こし完了、議事録更新、プロジェクト関連付け変更時に差分インデックス更新を実行
+/// - 不要な全件再生成を避け、Embeddingモデル変更時のみ互換性を確認し再インデックスを実行する
+@Observable
+@MainActor
+public final class EmbeddingService {
+    private let database: LocalDatabase
+    private let modelManager: ModelManager
+    private let jobManager: JobManager
+
+    public private(set) var chunks: [KnowledgeChunk] = []
+    public private(set) var embeddingsByChunkId: [UUID: EmbeddingRecord] = [:]
+    public private(set) var activeEmbeddingModelId: String
+
+    public init(database: LocalDatabase, modelManager: ModelManager, jobManager: JobManager) {
+        self.database = database
+        self.modelManager = modelManager
+        self.jobManager = jobManager
+        self.activeEmbeddingModelId = modelManager.globalSettings.embeddingModelId
+
+        let loadedChunks = (try? database.loadKnowledgeChunks()) ?? []
+        let loadedEmbeddings = (try? database.loadEmbeddingRecords()) ?? []
+        self.chunks = loadedChunks
+        var map: [UUID: EmbeddingRecord] = [:]
+        for record in loadedEmbeddings {
+            map[record.chunkId] = record
+        }
+        self.embeddingsByChunkId = map
+    }
+
+    /// ファイル登録・更新時の差分インデックス更新
+    public func indexDocument(_ document: Document, projectIds: [UUID]) throws {
+        try database.deleteKnowledgeChunks(sourceId: document.id)
+        chunks.removeAll { $0.sourceId == document.id }
+
+        let embModel = modelManager.model(withId: modelManager.globalSettings.embeddingModelId)
+            ?? modelManager.models(for: .embedding).first!
+        let adapter = LocalEmbeddingAdapter(model: embModel)
+
+        let paragraphs = Self.splitIntoChunks(text: document.extractedText, maxLength: 360)
+        for (idx, paragraph) in paragraphs.enumerated() {
+            let isImportant = paragraph.contains("決定") || paragraph.contains("仕様") || paragraph.contains("重要") || paragraph.contains("必須")
+            let chunk = KnowledgeChunk(
+                sourceType: .document,
+                sourceId: document.id,
+                projectIds: projectIds,
+                title: document.fileName,
+                content: paragraph,
+                chunkIndex: idx,
+                locationHint: "\(document.fileName) (セクション #\(idx + 1))",
+                isDecisionOrImportant: isImportant,
+                sourceUpdatedAt: document.updatedAt
+            )
+            let vector = adapter.generateEmbedding(for: "\(document.fileName) \(document.tags.joined(separator: " ")) \(paragraph)")
+            let record = EmbeddingRecord(
+                chunkId: chunk.id,
+                modelId: embModel.id,
+                dimensions: adapter.dimensions,
+                vector: vector
+            )
+            try database.saveKnowledgeChunk(chunk)
+            try database.saveEmbeddingRecord(record)
+            chunks.append(chunk)
+            embeddingsByChunkId[chunk.id] = record
+        }
+    }
+
+    /// 文字起こし完了・更新時の差分インデックス更新
+    public func indexTranscript(_ transcript: Transcript, segments: [TranscriptSegment]) throws {
+        try database.deleteKnowledgeChunks(sourceId: transcript.id)
+        chunks.removeAll { $0.sourceId == transcript.id }
+
+        let embModel = modelManager.model(withId: modelManager.globalSettings.embeddingModelId)
+            ?? modelManager.models(for: .embedding).first!
+        let adapter = LocalEmbeddingAdapter(model: embModel)
+
+        for segment in segments where !segment.isProvisional {
+            let timeLabel = LocalLLMAdapter.formatTimestamp(segment.startTimeSeconds)
+            let isImportant = segment.correctedText.contains("決定") || segment.correctedText.contains("合意") || segment.correctedText.contains("アクション")
+            let chunk = KnowledgeChunk(
+                sourceType: .transcriptSegment,
+                sourceId: transcript.id,
+                projectIds: transcript.projectIds,
+                title: transcript.title,
+                content: segment.correctedText,
+                chunkIndex: segment.sequenceIndex,
+                locationHint: "発話 [\(timeLabel)] (\(segment.speakerLabel))",
+                isDecisionOrImportant: isImportant,
+                sourceUpdatedAt: segment.updatedAt
+            )
+            let vector = adapter.generateEmbedding(for: "\(transcript.title) \(segment.correctedText)")
+            let record = EmbeddingRecord(
+                chunkId: chunk.id,
+                modelId: embModel.id,
+                dimensions: adapter.dimensions,
+                vector: vector
+            )
+            try database.saveKnowledgeChunk(chunk)
+            try database.saveEmbeddingRecord(record)
+            chunks.append(chunk)
+            embeddingsByChunkId[chunk.id] = record
+        }
+    }
+
+    /// 議事録生成・更新時の差分インデックス更新
+    public func indexMeeting(_ meeting: Meeting) throws {
+        try database.deleteKnowledgeChunks(sourceId: meeting.id)
+        chunks.removeAll { $0.sourceId == meeting.id }
+
+        let embModel = modelManager.model(withId: modelManager.globalSettings.embeddingModelId)
+            ?? modelManager.models(for: .embedding).first!
+        let adapter = LocalEmbeddingAdapter(model: embModel)
+
+        var sectionsToIndex: [(text: String, hint: String, important: Bool)] = []
+        if !meeting.overview.isEmpty {
+            sectionsToIndex.append((meeting.overview, "会議の概要", false))
+        }
+        for decision in meeting.decisions {
+            sectionsToIndex.append((decision, "決定事項", true))
+        }
+        for item in meeting.actionItems {
+            let assignee = item.assignee ?? "未定"
+            let due = item.dueDateText ?? "未定"
+            sectionsToIndex.append(("\(item.title) (担当: \(assignee), 期限: \(due))", "TODO・アクションアイテム", true))
+        }
+        for issue in meeting.unresolvedIssues {
+            sectionsToIndex.append((issue, "未解決事項", false))
+        }
+
+        for (idx, entry) in sectionsToIndex.enumerated() {
+            let chunk = KnowledgeChunk(
+                sourceType: .meetingMinutes,
+                sourceId: meeting.id,
+                projectIds: meeting.projectIds,
+                title: meeting.title,
+                content: entry.text,
+                chunkIndex: idx,
+                locationHint: "議事録『\(meeting.title)』- \(entry.hint)",
+                isDecisionOrImportant: entry.important,
+                sourceUpdatedAt: meeting.updatedAt
+            )
+            let vector = adapter.generateEmbedding(for: "\(meeting.title) \(entry.hint) \(entry.text)")
+            let record = EmbeddingRecord(
+                chunkId: chunk.id,
+                modelId: embModel.id,
+                dimensions: adapter.dimensions,
+                vector: vector
+            )
+            try database.saveKnowledgeChunk(chunk)
+            try database.saveEmbeddingRecord(record)
+            chunks.append(chunk)
+            embeddingsByChunkId[chunk.id] = record
+        }
+    }
+
+    /// プロジェクト関連付け変更時に、再ベクトル化を行わずメタデータのみ高速更新する（仕様書 §11.3）
+    public func updateProjectAssociationsForSource(sourceId: UUID, projectIds: [UUID]) throws {
+        for idx in chunks.indices where chunks[idx].sourceId == sourceId {
+            chunks[idx].projectIds = projectIds
+            try database.saveKnowledgeChunk(chunks[idx])
+        }
+    }
+
+    /// 仕様書 §3.5: Embeddingモデル変更時の互換性確認と必要に応じたインデックス再生成
+    @discardableResult
+    public func verifyAndReindexIfIncompatible(targetModel: AIModel) async throws -> Int {
+        let incompatibleChunks = chunks.filter { chunk in
+            guard let rec = embeddingsByChunkId[chunk.id] else { return true }
+            return rec.modelId != targetModel.id
+        }
+
+        guard !incompatibleChunks.isEmpty else {
+            self.activeEmbeddingModelId = targetModel.id
+            return 0
+        }
+
+        return try await jobManager.enqueueAndRun(
+            type: .embeddingGeneration,
+            title: "Embedding互換性更新・再インデックス (\(targetModel.name))",
+            priority: .lowBackground,
+            modelId: targetModel.id,
+            requiredMemoryMB: targetModel.requiredMemoryMB
+        ) {
+            let adapter = LocalEmbeddingAdapter(model: targetModel)
+            for chunk in incompatibleChunks {
+                let vec = adapter.generateEmbedding(for: "\(chunk.title) \(chunk.content)")
+                let record = EmbeddingRecord(
+                    chunkId: chunk.id,
+                    modelId: targetModel.id,
+                    dimensions: adapter.dimensions,
+                    vector: vec
+                )
+                try self.database.saveEmbeddingRecord(record)
+                self.embeddingsByChunkId[chunk.id] = record
+            }
+            self.activeEmbeddingModelId = targetModel.id
+            return (incompatibleChunks.count, "\(incompatibleChunks.count)件のチャンクを \(targetModel.name) で再ベクトル化しました")
+        }
+    }
+
+    public static func splitIntoChunks(text: String, maxLength: Int = 360) -> [String] {
+        let lines = text
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        guard !lines.isEmpty else { return [] }
+
+        var result: [String] = []
+        var current = ""
+        for line in lines {
+            if current.count + line.count + 1 > maxLength && !current.isEmpty {
+                result.append(current)
+                current = line
+            } else {
+                current = current.isEmpty ? line : "\(current)\n\(line)"
+            }
+        }
+        if !current.isEmpty {
+            result.append(current)
+        }
+        return result
+    }
+}

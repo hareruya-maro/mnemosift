@@ -1,0 +1,15 @@
+.DS_Store
+/.build
+/Packages
+xcuserdata/
+DerivedData/
+.swiftpm/
+*.xcodeproj/project.xcworkspace/
+*.xcodeproj/xcuserdata/
+*.moved-aside
+*.ipa
+*.dSYM.zip
+*.dSYM
+*.db
+*.db-shm
+*.db-wal
