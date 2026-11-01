@@ -11,6 +11,7 @@ public struct SettingsAndToolsSheet: View {
 
     public enum SettingsTab: String, CaseIterable, Identifiable {
         case models = "🤖 AIモデル・保存設定"
+        case googleDrive = "☁️ Google Drive連携"
         case externalTools = "🔌 外部LLM連携 (MCP / CLI)"
         case diagnostics = "⚡ 処理履歴・技術検証"
         public var id: String { rawValue }
@@ -35,7 +36,7 @@ public struct SettingsAndToolsSheet: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .frame(width: 520)
+                .frame(width: 660)
                 Spacer()
                 Button("閉じる", systemImage: "xmark.circle.fill") {
                     workspace.isShowingSettingsSheet = false
@@ -51,6 +52,8 @@ public struct SettingsAndToolsSheet: View {
             switch selectedTab {
             case .models:
                 SettingsView(workspace: workspace)
+            case .googleDrive:
+                GoogleDriveSyncSettingsView(workspace: workspace)
             case .externalTools:
                 externalToolBridgeTabView
             case .diagnostics:

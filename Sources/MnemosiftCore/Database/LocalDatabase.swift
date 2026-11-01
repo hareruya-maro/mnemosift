@@ -214,6 +214,29 @@ public final class LocalDatabase: @unchecked Sendable {
         try executeRaw(sql)
     }
 
+    public func withTransaction<R>(_ body: (OpaquePointer) throws -> R) throws -> R {
+        try withSQLiteHandle { db in
+            var errMsg: UnsafeMutablePointer<CChar>?
+            guard sqlite3_exec(db, "BEGIN IMMEDIATE TRANSACTION;", nil, nil, &errMsg) == SQLITE_OK else {
+                let msg = errMsg.map { String(cString: $0) } ?? "BEGIN TRANSACTION failed"
+                sqlite3_free(errMsg)
+                throw DatabaseError.executionFailed(msg)
+            }
+            do {
+                let result = try body(db)
+                guard sqlite3_exec(db, "COMMIT;", nil, nil, &errMsg) == SQLITE_OK else {
+                    let msg = errMsg.map { String(cString: $0) } ?? "COMMIT failed"
+                    sqlite3_free(errMsg)
+                    throw DatabaseError.executionFailed(msg)
+                }
+                return result
+            } catch {
+                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                throw error
+            }
+        }
+    }
+
     private func executeRaw(_ sql: String) throws {
         lock.lock()
         defer { lock.unlock() }

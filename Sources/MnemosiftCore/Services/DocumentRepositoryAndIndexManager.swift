@@ -1180,12 +1180,13 @@ public final class IndexManager: @unchecked Sendable {
             try repository.deleteDocumentChunks(ids: oldChunks.map(\.id))
         }
 
-        // 元テキストを `document_contents` に保存 (§4.2)
+        // 元テキストを `document_contents` に保存 (§4.2, Google Drive仕様書 §6.1 & §12.3: Google Drive文書は元のMarkdown全文を別途丸ごと保存せずチャンクテキストのみ保持)
         let isAccessible = sourceURI.isEmpty || !sourceURI.hasPrefix("/") || FileManager.default.fileExists(atPath: sourceURI)
+        let persistedRawText = (sourceType == .googleDrive) ? "" : rawText
         try repository.upsertDocumentContent(DocumentContentRecord(
             documentId: id,
-            rawText: rawText,
-            isExternalCacheOnly: sourceType == .external,
+            rawText: persistedRawText,
+            isExternalCacheOnly: sourceType == .external || sourceType == .googleDrive,
             isSourceAccessible: isAccessible,
             updatedAt: now
         ))
@@ -1330,11 +1331,16 @@ public final class IndexManager: @unchecked Sendable {
         let targets = allDocs.filter { $0.indexStatus == .error || $0.indexStatus == .pending }
         var retried = 0
         for doc in targets {
-            guard let content = try repository.fetchDocumentContent(documentId: doc.id) else { continue }
+            let content = try repository.fetchDocumentContent(documentId: doc.id)
+            let chunks = try repository.fetchDocumentChunks(documentId: doc.id)
+            let rawText = (content?.rawText.isEmpty == false)
+                ? (content?.rawText ?? "")
+                : chunks.map(\.text).joined(separator: "\n\n")
+            guard !rawText.isEmpty else { continue }
             _ = try indexDocument(
                 id: doc.id,
                 title: doc.title,
-                rawText: content.rawText,
+                rawText: rawText,
                 type: doc.type,
                 sourceType: doc.sourceType,
                 sourceURI: doc.sourceURI,
@@ -1362,11 +1368,16 @@ public final class IndexManager: @unchecked Sendable {
         let allDocs = try repository.fetchAllDocuments(onlyReady: false)
         var count = 0
         for doc in allDocs {
-            guard let content = try repository.fetchDocumentContent(documentId: doc.id) else { continue }
+            let content = try repository.fetchDocumentContent(documentId: doc.id)
+            let chunks = try repository.fetchDocumentChunks(documentId: doc.id)
+            let rawText = (content?.rawText.isEmpty == false)
+                ? (content?.rawText ?? "")
+                : chunks.map(\.text).joined(separator: "\n\n")
+            guard !rawText.isEmpty else { continue }
             _ = try indexDocument(
                 id: doc.id,
                 title: doc.title,
-                rawText: content.rawText,
+                rawText: rawText,
                 type: doc.type,
                 sourceType: doc.sourceType,
                 sourceURI: doc.sourceURI,
@@ -1381,5 +1392,73 @@ public final class IndexManager: @unchecked Sendable {
         }
         try repository.rebuildFTS5Index()
         return count
+    }
+
+    // MARK: - Google Drive 自動同期仕様書 §7.1, §5.4, §11.3 統合ヘルパー
+
+    /// Google Drive 共通入力 (`ImportableDocument`) を既存の2階層検索インデックスへ登録・更新する (§7.1, §11.3)
+    /// - 既に正常なインデックス (`index_status == .ready`) が存在する状態で再インデックスに失敗した場合、既存の正常な検索インデックスを破壊せず保護する (§11.3)
+    @discardableResult
+    public func indexImportableDocument(
+        _ importable: ImportableDocument,
+        documentId: String,
+        projectIds: [UUID] = [],
+        embeddingAdapter: any EmbeddingAdapter,
+        forceReindex: Bool = false,
+        simulateFailureForTesting: Bool = false
+    ) throws -> DocumentIndexingOutcome {
+        let existingDoc = try repository.fetchDocument(id: documentId)
+        if simulateFailureForTesting, let existingDoc, existingDoc.indexStatus == .ready {
+            // §11.3 既存の正常なインデックス（documents / document_chunks / search_units / embeddings）は破壊しない
+            throw DatabaseError.executionFailed("Simulated indexing failure while preserving existing ready index")
+        }
+        return try indexDocument(
+            id: documentId,
+            title: importable.title,
+            rawText: importable.content,
+            type: .document,
+            sourceType: importable.sourceType,
+            sourceURI: importable.sourceURI ?? "",
+            occurredAt: importable.updatedAt,
+            createdAt: importable.createdAt ?? importable.updatedAt,
+            projectIds: projectIds,
+            participants: [],
+            embeddingAdapter: embeddingAdapter,
+            forceReindex: forceReindex,
+            simulateFailureForTesting: simulateFailureForTesting
+        )
+    }
+
+    /// §5.4 タイトルのみ変更時の高速インデックス更新（チャンク分割やチャンクEmbedding再生成を行わず、タイトル検索用インデックスと文書要約ベクターのみ更新）
+    public func updateDocumentTitleOnly(
+        documentId: String,
+        newTitle: String,
+        modifiedAt: Date = Date(),
+        embeddingAdapter: any EmbeddingAdapter
+    ) throws {
+        guard var doc = try repository.fetchDocument(id: documentId) else { return }
+        guard doc.title != newTitle else { return }
+
+        doc.title = newTitle
+        doc.updatedAt = modifiedAt
+        try repository.upsertDocument(doc)
+
+        let units = try repository.fetchSearchUnits(documentId: documentId)
+        if var docUnit = units.first(where: { $0.unitType == .document }) {
+            let newTitleTerms = textAnalyzer.buildFTS5TokenString(for: newTitle, titleContext: newTitle)
+            docUnit.titleTerms = newTitleTerms
+            try repository.updateSearchUnit(docUnit)
+
+            let docVectorInput = "\(newTitle) \(docUnit.keywords) \(doc.summary)"
+            let docVector = embeddingAdapter.generateEmbedding(for: docVectorInput)
+            try repository.vectorStore.saveVector(StoredVectorRecord(
+                searchUnitId: docUnit.id,
+                embeddingModelId: embeddingAdapter.model.id,
+                embeddingDimension: embeddingAdapter.dimensions,
+                embeddingVersion: configuration.indexingVersion,
+                generatedAt: modifiedAt,
+                vector: docVector
+            ))
+        }
     }
 }

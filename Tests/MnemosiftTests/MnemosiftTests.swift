@@ -10,7 +10,11 @@ struct MnemosiftTests {
     private func makeIsolatedController(seedDemo: Bool = false) throws -> AppWorkspaceController {
         let tempDB = FileManager.default.temporaryDirectory
             .appendingPathComponent("test-mnemosift-\(UUID().uuidString).sqlite3").path
-        return try AppWorkspaceController(databasePath: tempDB, seedDemoDataIfEmpty: seedDemo)
+        return try AppWorkspaceController(
+            databasePath: tempDB,
+            seedDemoDataIfEmpty: seedDemo,
+            googleOAuthTokenStore: InMemoryKeychainTokenStore()
+        )
     }
 
     @Test("1. AIモデル管理と3段階設定優先順位（実行時指定 > プロジェクト設定 > 全体設定）の検証")
@@ -1129,5 +1133,468 @@ struct MnemosiftTests {
         let deletedDoc = try #require(ws.documentService.documents.first(where: { $0.fileName == "security_checklist.txt" }))
         let docContentRecord = try #require(try ws.embeddingService.documentRepository.fetchDocumentContent(documentId: deletedDoc.id.uuidString))
         #expect(docContentRecord.isSourceAccessible == false)
+    }
+
+    // MARK: - Google Drive フォルダ自動同期機能 実装仕様書 v1.0 (§13 テスト仕様)
+
+    @Test("16. Google Drive 初回同期テスト (§13.1): 単一/複数フォルダ、サブフォルダ再帰、対象外MIME除外、100件超ページネーション、マルチタブフォールバック")
+    func testGoogleDriveInitialSync() async throws {
+        let ws = try makeIsolatedController()
+        let apiClient = ControllableGoogleDriveAPIClient(seedDemoDriveItems: false)
+        ws.googleDriveSyncService.apiClient = apiClient
+
+        // 1. Google アカウント連携（PKCE認証・Keychainトークン保存）
+        let account = try await ws.googleDriveSyncService.connectGoogleAccount(authorizationCode: "valid_pkce_code")
+        #expect(account.email == "engineer@example.com")
+        #expect(account.status == .connected)
+        #expect(try ws.googleDriveSyncService.tokenStore.loadTokens(forAccountId: account.id) != nil)
+
+        // 2. モックDrive環境の構築
+        // ルートフォルダ、サブフォルダ、共有ドライブフォルダ
+        let rootFolder = GoogleDriveFileItem(
+            id: "folder-eng-spec",
+            name: "エンジニア設計仕様",
+            mimeType: GoogleDriveConstants.googleFolderMimeType,
+            parents: ["root"],
+            modifiedTime: Date()
+        )
+        let subFolder = GoogleDriveFileItem(
+            id: "folder-eng-arch",
+            name: "アーキテクチャ詳細",
+            mimeType: GoogleDriveConstants.googleFolderMimeType,
+            parents: ["folder-eng-spec"],
+            modifiedTime: Date()
+        )
+        apiClient.upsertRemoteItem(rootFolder, recordChange: false)
+        apiClient.upsertRemoteItem(subFolder, recordChange: false)
+
+        // Google ドキュメント（ルート直下 1件、サブフォルダ配下 1件）
+        let doc1 = GoogleDriveFileItem(
+            id: "gdoc-oauth-spec",
+            name: "Google Drive OAuth認証仕様書",
+            mimeType: GoogleDriveConstants.googleDocMimeType,
+            parents: ["folder-eng-spec"],
+            modifiedTime: Date(),
+            webViewLink: "https://docs.google.com/document/d/gdoc-oauth-spec/edit"
+        )
+        let doc1Markdown = """
+        # Google Drive OAuth認証仕様書
+        PKCE (S256) を用いてシステムブラウザ上で認可を行い、macOS Keychainにトークンを安全保存する。
+        """
+        apiClient.upsertRemoteItem(doc1, markdown: doc1Markdown, recordChange: false)
+
+        let doc2 = GoogleDriveFileItem(
+            id: "gdoc-db-arch",
+            name: "ローカルSQLite2階層インデックス設計",
+            mimeType: GoogleDriveConstants.googleDocMimeType,
+            parents: ["folder-eng-arch"],
+            modifiedTime: Date(),
+            webViewLink: "https://docs.google.com/document/d/gdoc-db-arch/edit"
+        )
+        let doc2Markdown = """
+        # ローカルSQLite2階層インデックス設計
+        文書要約とチャンク単位のベクターおよびFTS5全文検索により高速なRRFハイブリッド検索を実現する。
+        """
+        apiClient.upsertRemoteItem(doc2, markdown: doc2Markdown, recordChange: false)
+
+        // 対象外ファイル（スプレッドシート、ショートカット）
+        let sheet = GoogleDriveFileItem(
+            id: "gsheet-budget",
+            name: "開発予算シート",
+            mimeType: GoogleDriveConstants.googleSpreadsheetMimeType,
+            parents: ["folder-eng-spec"],
+            modifiedTime: Date()
+        )
+        let shortcut = GoogleDriveFileItem(
+            id: "shortcut-memo",
+            name: "外部メモへのショートカット",
+            mimeType: GoogleDriveConstants.googleShortcutMimeType,
+            parents: ["folder-eng-spec"],
+            modifiedTime: Date()
+        )
+        apiClient.upsertRemoteItem(sheet, recordChange: false)
+        apiClient.upsertRemoteItem(shortcut, recordChange: false)
+
+        // 3. 初回同期の実行（サブフォルダ再帰有効）
+        let syncFolder = try await ws.googleDriveSyncService.addSyncFolder(
+            accountId: account.id,
+            folderId: rootFolder.id,
+            folderName: rootFolder.name,
+            includeSubfolders: true,
+            performInitialSyncImmediately: true
+        )
+        #expect(syncFolder.syncStatus == .idle)
+        #expect(syncFolder.lastSyncedAt != nil)
+
+        // 4. 初回同期前に Changes API の startPageToken が取得・保存されていることの検証 (§4.1 #2)
+        let cursor = try #require(try ws.googleDriveSyncService.syncRepository.fetchSyncCursor(accountId: account.id))
+        #expect(!cursor.pageToken.isEmpty)
+
+        // 5. Google ドキュメント 2件のみがインデックス登録され、対象外ファイルは除外されていること
+        let indexedDoc1 = try ws.embeddingService.documentRepository.fetchDocument(
+            id: GoogleDriveSyncService.canonicalDocumentId(accountId: account.id, externalFileId: doc1.id)
+        )
+        let indexedDoc2 = try ws.embeddingService.documentRepository.fetchDocument(
+            id: GoogleDriveSyncService.canonicalDocumentId(accountId: account.id, externalFileId: doc2.id)
+        )
+        #expect(indexedDoc1 != nil)
+        #expect(indexedDoc2 != nil)
+        #expect(indexedDoc1?.sourceType == .googleDrive)
+        #expect(indexedDoc2?.sourceType == .googleDrive)
+
+        // 対象外ファイルは documents テーブルにも external_documents テーブルにも登録されていないこと
+        let sheetExt = try ws.googleDriveSyncService.syncRepository.fetchExternalDocument(accountId: account.id, externalFileId: sheet.id)
+        let shortcutExt = try ws.googleDriveSyncService.syncRepository.fetchExternalDocument(accountId: account.id, externalFileId: shortcut.id)
+        #expect(sheetExt == nil)
+        #expect(shortcutExt == nil)
+
+        // 6. 原本Markdown全文は恒久保存せず空文字列になっていること（§6.1, §12.3 原本非保存と省容量化）
+        let content1 = try #require(try ws.embeddingService.documentRepository.fetchDocumentContent(documentId: indexedDoc1!.id))
+        #expect(content1.rawText.isEmpty)
+        #expect(content1.isExternalCacheOnly == true)
+
+        // 7. エクスポートサイズ上限超過時の Google Docs API マルチタブフォールバック検証 (§4.4, §4.5)
+        let largeDoc = GoogleDriveFileItem(
+            id: "gdoc-large-multitab",
+            name: "大規模マルチタブ仕様書",
+            mimeType: GoogleDriveConstants.googleDocMimeType,
+            parents: ["folder-eng-spec"],
+            modifiedTime: Date()
+        )
+        let structuredLargeDoc = GoogleDocsStructuredDocument(
+            documentId: largeDoc.id,
+            title: largeDoc.name,
+            tabs: [
+                GoogleDocTabContent(
+                    tabId: "tab-1",
+                    title: "第1章 概要",
+                    index: 0,
+                    markdownOrStructuredText: "第1章の内容: 大規模ドキュメントのフォールバック動作を検証する。"
+                ),
+                GoogleDocTabContent(
+                    tabId: "tab-2",
+                    title: "第2章 詳細設計",
+                    index: 1,
+                    markdownOrStructuredText: "第2章の内容: Google Docs API includeTabsContent=true によりマルチタブを解析する。"
+                )
+            ]
+        )
+        apiClient.upsertRemoteItem(largeDoc, structuredDoc: structuredLargeDoc, simulateExportSizeExceeded: true, recordChange: false)
+
+        try await ws.googleDriveSyncService.performInitialSync(forSyncFolderId: syncFolder.id)
+        let indexedLargeDoc = try #require(try ws.embeddingService.documentRepository.fetchDocument(
+            id: GoogleDriveSyncService.canonicalDocumentId(accountId: account.id, externalFileId: largeDoc.id)
+        ))
+        #expect(indexedLargeDoc.indexStatus == .ready)
+
+        // マルチタブの内容で検索できること
+        let tabHits = ws.searchService.searchDocuments(query: "includeTabsContent", mode: .ftsOnly)
+        #expect(tabHits.contains(where: { $0.documentId == indexedLargeDoc.id }))
+    }
+
+    @Test("17. Google Drive 差分同期テスト (§13.2): 10種類の変更イベント、Coalescing、未変更スキップ、所属管理")
+    func testGoogleDriveIncrementalSyncEvents() async throws {
+        let ws = try makeIsolatedController()
+        let apiClient = ControllableGoogleDriveAPIClient(seedDemoDriveItems: false)
+        ws.googleDriveSyncService.apiClient = apiClient
+
+        let account = try await ws.googleDriveSyncService.connectGoogleAccount()
+
+        let folder = GoogleDriveFileItem(
+            id: "folder-project-x",
+            name: "プロジェクトX資料",
+            mimeType: GoogleDriveConstants.googleFolderMimeType,
+            parents: ["root"],
+            modifiedTime: Date()
+        )
+        apiClient.upsertRemoteItem(folder, recordChange: false)
+
+        let initialDoc = GoogleDriveFileItem(
+            id: "doc-target-01",
+            name: "プロジェクトX要件定義書",
+            mimeType: GoogleDriveConstants.googleDocMimeType,
+            parents: ["folder-project-x"],
+            modifiedTime: Date()
+        )
+        apiClient.upsertRemoteItem(initialDoc, markdown: "# プロジェクトX要件定義書\n初期の要件定義内容。", recordChange: false)
+
+        _ = try await ws.googleDriveSyncService.addSyncFolder(
+            accountId: account.id,
+            folderId: folder.id,
+            folderName: folder.name,
+            includeSubfolders: true,
+            performInitialSyncImmediately: true
+        )
+
+        let targetDocId = GoogleDriveSyncService.canonicalDocumentId(accountId: account.id, externalFileId: initialDoc.id)
+        #expect(try ws.embeddingService.documentRepository.fetchDocument(id: targetDocId) != nil)
+
+        // Event 1 & 2: 新規ドキュメント追加と本文更新
+        let newDoc = GoogleDriveFileItem(
+            id: "doc-target-02",
+            name: "外部API連携仕様",
+            mimeType: GoogleDriveConstants.googleDocMimeType,
+            parents: ["folder-project-x"],
+            modifiedTime: Date()
+        )
+        apiClient.upsertRemoteItem(newDoc, markdown: "# 外部API連携仕様\nSlack通知とWebhook連携を行う。", recordChange: true)
+
+        try await ws.googleDriveSyncService.performIncrementalSync(accountId: account.id)
+        let indexedNewDocId = GoogleDriveSyncService.canonicalDocumentId(accountId: account.id, externalFileId: newDoc.id)
+        #expect(try ws.embeddingService.documentRepository.fetchDocument(id: indexedNewDocId) != nil)
+
+        // Event 3: タイトルのみ変更（本文未変更 -> 高速更新でチャンクEmbedding再生成スキップ §5.4）
+        var renamedDoc = initialDoc
+        renamedDoc.name = "プロジェクトX要件定義書（改訂版）"
+        apiClient.upsertRemoteItem(renamedDoc, markdown: "# プロジェクトX要件定義書\n初期の要件定義内容。", recordChange: true)
+
+        _ = apiClient.exportCallCountByFileId[initialDoc.id] ?? 0
+        try await ws.googleDriveSyncService.performIncrementalSync(accountId: account.id)
+        let renamedIndexed = try #require(try ws.embeddingService.documentRepository.fetchDocument(id: targetDocId))
+        #expect(renamedIndexed.title == "プロジェクトX要件定義書（改訂版）")
+
+        // 改訂版タイトルで即座にFTS5ヒットすること
+        let titleHits = ws.searchService.searchDocuments(query: "改訂版", mode: .ftsOnly)
+        #expect(titleHits.contains(where: { $0.documentId == targetDocId }))
+
+        // Event 4 & 5: 対象フォルダ外への移動（検索インデックス除外 §5.3 #5）
+        var movedOutDoc = newDoc
+        movedOutDoc.parents = ["some-other-untracked-folder"]
+        apiClient.upsertRemoteItem(movedOutDoc, markdown: "# 外部API連携仕様\nSlack通知とWebhook連携を行う。", recordChange: true)
+
+        try await ws.googleDriveSyncService.performIncrementalSync(accountId: account.id)
+        #expect(try ws.embeddingService.documentRepository.fetchDocument(id: indexedNewDocId) == nil)
+        #expect(try ws.googleDriveSyncService.syncRepository.fetchExternalDocument(accountId: account.id, externalFileId: newDoc.id) == nil)
+
+        // Event 6: 文書の削除（Changes API で removed=true -> 検索インデックスから削除 §5.3 #6）
+        apiClient.removeRemoteItem(fileId: initialDoc.id, driveId: nil)
+        try await ws.googleDriveSyncService.performIncrementalSync(accountId: account.id)
+        #expect(try ws.embeddingService.documentRepository.fetchDocument(id: targetDocId) == nil)
+
+        // Event 8 & 9: サブフォルダ追加と配下文書の自動インデックス (§5.3 #8)
+        let dynamicSubFolder = GoogleDriveFileItem(
+            id: "folder-sub-release",
+            name: "リリース手順",
+            mimeType: GoogleDriveConstants.googleFolderMimeType,
+            parents: ["folder-project-x"],
+            modifiedTime: Date()
+        )
+        apiClient.upsertRemoteItem(dynamicSubFolder, recordChange: true)
+
+        let docInsideSub = GoogleDriveFileItem(
+            id: "doc-release-manual",
+            name: "TestFlight公開チェックリスト",
+            mimeType: GoogleDriveConstants.googleDocMimeType,
+            parents: ["folder-sub-release"],
+            modifiedTime: Date()
+        )
+        apiClient.upsertRemoteItem(docInsideSub, markdown: "# TestFlight公開チェックリスト\nProvisioning Profileを確認する。", recordChange: true)
+
+        try await ws.googleDriveSyncService.performIncrementalSync(accountId: account.id)
+        let subDocId = GoogleDriveSyncService.canonicalDocumentId(accountId: account.id, externalFileId: docInsideSub.id)
+        #expect(try ws.embeddingService.documentRepository.fetchDocument(id: subDocId) != nil)
+
+        // Event 10: サブフォルダが対象外へ移動された場合、配下文書も検索インデックスから除外されること (§5.3 #10)
+        var movedSubFolder = dynamicSubFolder
+        movedSubFolder.parents = ["outside-folder"]
+        apiClient.upsertRemoteItem(movedSubFolder, recordChange: true)
+
+        try await ws.googleDriveSyncService.performIncrementalSync(accountId: account.id)
+        #expect(try ws.embeddingService.documentRepository.fetchDocument(id: subDocId) == nil)
+    }
+
+    @Test("18. Google Drive 障害・復旧テスト (§13.3): オフライン、401再認証、429指数バックオフ、アプリ中断ジョブ再開、旧正常インデックス保護")
+    func testGoogleDriveResilienceAndErrorRecovery() async throws {
+        let ws = try makeIsolatedController()
+        let apiClient = ControllableGoogleDriveAPIClient(seedDemoDriveItems: false)
+        ws.googleDriveSyncService.apiClient = apiClient
+
+        let account = try await ws.googleDriveSyncService.connectGoogleAccount()
+
+        let folder = GoogleDriveFileItem(
+            id: "folder-resilience",
+            name: "耐障害性テストフォルダ",
+            mimeType: GoogleDriveConstants.googleFolderMimeType,
+            parents: ["root"],
+            modifiedTime: Date()
+        )
+        apiClient.upsertRemoteItem(folder, recordChange: false)
+
+        let doc = GoogleDriveFileItem(
+            id: "doc-resilience-01",
+            name: "耐障害性ドキュメント",
+            mimeType: GoogleDriveConstants.googleDocMimeType,
+            parents: ["folder-resilience"],
+            modifiedTime: Date()
+        )
+        apiClient.upsertRemoteItem(doc, markdown: "# 耐障害性ドキュメント\n正常な本文。", recordChange: false)
+
+        _ = try await ws.googleDriveSyncService.addSyncFolder(
+            accountId: account.id,
+            folderId: folder.id,
+            folderName: folder.name,
+            performInitialSyncImmediately: true
+        )
+        let docId = GoogleDriveSyncService.canonicalDocumentId(accountId: account.id, externalFileId: doc.id)
+        #expect(try ws.embeddingService.documentRepository.fetchDocument(id: docId) != nil)
+
+        // 1. 429 レート制限の発生と指数バックオフ再試行成功の検証 (§11.1, §13.3)
+        apiClient.transientFailureRemainingCountByTargetId[doc.id] = 2 // 2回失敗して3回目で成功
+        apiClient.transientFailureErrorKind = .rateLimited(retryAfterSeconds: 0.01)
+
+        var updatedDoc = doc
+        updatedDoc.modifiedTime = "2026-11-01T22:00:00.000Z"
+        apiClient.upsertRemoteItem(updatedDoc, markdown: "# 耐障害性ドキュメント\nレート制限後の更新本文。", recordChange: true)
+
+        try await ws.googleDriveSyncService.performIncrementalSync(accountId: account.id)
+        let retriedDoc = try #require(try ws.embeddingService.documentRepository.fetchDocument(id: docId))
+        #expect(retriedDoc.indexStatus == .ready)
+
+        // 2. 401 認証失効時の `auth_required` 遷移と検索データ保護 (§11.1, §13.3)
+        apiClient.simulatedAuthFailureForAccountIds.insert(account.id)
+        do {
+            try await ws.googleDriveSyncService.performIncrementalSync(accountId: account.id)
+        } catch {
+            // 401 が送出されること
+        }
+        #expect(ws.googleDriveSyncService.syncState == .authRequired("Refresh Token が失効しています。再認証が必要です。"))
+        let refreshedFolder = try #require(try ws.googleDriveSyncService.syncRepository.fetchSyncFolders(accountId: account.id).first)
+        #expect(refreshedFolder.syncStatus == .authRequired)
+        // 認証切れでも既存の検索インデックスは失われないこと
+        #expect(try ws.embeddingService.documentRepository.fetchDocument(id: docId) != nil)
+
+        // 認証復帰
+        apiClient.simulatedAuthFailureForAccountIds.removeAll()
+        _ = try await ws.googleDriveSyncService.connectGoogleAccount()
+
+        // 3. インデックス生成失敗時の旧正常インデックス保護 (§11.3)
+        ws.googleDriveSyncService.failingIndexingExternalFileIdsForTesting.insert(doc.id)
+        var failingUpdateDoc = doc
+        failingUpdateDoc.modifiedTime = "2026-11-01T23:00:00.000Z"
+        apiClient.upsertRemoteItem(failingUpdateDoc, markdown: "# 破壊的更新テスト\n失敗するべき本文。", recordChange: true)
+
+        do {
+            try await ws.googleDriveSyncService.performIncrementalSync(accountId: account.id)
+        } catch {
+            // エラー送出
+        }
+        // 旧正常インデックス（ready）が破壊されずに保護されていること
+        let preservedDoc = try #require(try ws.embeddingService.documentRepository.fetchDocument(id: docId))
+        #expect(preservedDoc.indexStatus == .ready)
+        #expect(preservedDoc.title == "耐障害性ドキュメント")
+
+        // 4. 同期処理途中のアプリ終了シミュレーションと次回起動時のジョブ再開 (§5.2, §13.3)
+        ws.googleDriveSyncService.failingIndexingExternalFileIdsForTesting.removeAll()
+        let interruptedDoc = GoogleDriveFileItem(
+            id: "doc-interrupted-01",
+            name: "中断再開ドキュメント",
+            mimeType: GoogleDriveConstants.googleDocMimeType,
+            parents: ["folder-resilience"],
+            modifiedTime: Date()
+        )
+        apiClient.upsertRemoteItem(interruptedDoc, markdown: "# 中断再開ドキュメント\n再起動後に再開される。", recordChange: true)
+
+        // 0件処理で中断シミュレート
+        ws.googleDriveSyncService.maxJobsToProcessBeforeSimulatedInterrupt = 0
+        try await ws.googleDriveSyncService.performIncrementalSync(accountId: account.id)
+
+        let pendingJobs = try ws.googleDriveSyncService.syncRepository.fetchSyncJobs(
+            accountId: account.id,
+            statuses: [.pending]
+        )
+        #expect(!pendingJobs.isEmpty)
+
+        // 中断解除して再同期 -> 未完了ジョブが正常に処理されること
+        ws.googleDriveSyncService.maxJobsToProcessBeforeSimulatedInterrupt = nil
+        try await ws.googleDriveSyncService.performIncrementalSync(accountId: account.id)
+
+        let interruptedDocId = GoogleDriveSyncService.canonicalDocumentId(accountId: account.id, externalFileId: interruptedDoc.id)
+        #expect(try ws.embeddingService.documentRepository.fetchDocument(id: interruptedDocId) != nil)
+        let remainingPending = try ws.googleDriveSyncService.syncRepository.fetchSyncJobs(
+            accountId: account.id,
+            statuses: [.pending]
+        )
+        #expect(remainingPending.isEmpty)
+    }
+
+    @Test("19. Google Drive 検索統合テスト (§13.4): 議事録との横断ハイブリッド検索、原本遷移、オフライン検索、アカウント解除保護")
+    func testGoogleDriveSearchIntegrationAndDisconnection() async throws {
+        let ws = try makeIsolatedController()
+        let apiClient = ControllableGoogleDriveAPIClient(seedDemoDriveItems: false)
+        ws.googleDriveSyncService.apiClient = apiClient
+
+        // 1. Google アカウントとフォルダの登録
+        let account = try await ws.googleDriveSyncService.connectGoogleAccount()
+        let folder = GoogleDriveFileItem(
+            id: "folder-tech-docs",
+            name: "技術資料",
+            mimeType: GoogleDriveConstants.googleFolderMimeType,
+            parents: ["root"],
+            modifiedTime: Date()
+        )
+        apiClient.upsertRemoteItem(folder, recordChange: false)
+
+        let gdoc = GoogleDriveFileItem(
+            id: "gdoc-flutter-firebase",
+            name: "Firebase認証とFlutterアプリ連携設計",
+            mimeType: GoogleDriveConstants.googleDocMimeType,
+            parents: ["folder-tech-docs"],
+            modifiedTime: Date(),
+            webViewLink: "https://docs.google.com/document/d/gdoc-flutter-firebase/edit"
+        )
+        let gdocBody = """
+        # Firebase認証とFlutterアプリ連携設計
+        AppleログインおよびGoogleログインをFirebase Authentication経由で統一的に検証する。
+        """
+        apiClient.upsertRemoteItem(gdoc, markdown: gdocBody, recordChange: false)
+
+        _ = try await ws.googleDriveSyncService.addSyncFolder(
+            accountId: account.id,
+            folderId: folder.id,
+            folderName: folder.name,
+            performInitialSyncImmediately: true
+        )
+
+        // 2. ローカル議事録の登録
+        let meeting = Meeting(
+            title: "モバイルアプリ認証基盤検討会議",
+            overview: "Firebase認証を採用するか、Appleログイン単体で進めるかを議論しました。",
+            markdownContent: "# モバイルアプリ認証基盤検討会議\nFirebase認証を採用するか、Appleログイン単体で進めるかを議論しました。"
+        )
+        try ws.database.saveMeeting(meeting)
+        try ws.embeddingService.indexMeeting(meeting)
+
+        // 3. 横断ハイブリッド検索の実行（Googleドキュメントと議事録の両方がヒットすること §1.1, §7.2, §13.4）
+        let searchResults = ws.searchService.search(
+            query: "Firebase 認証 Appleログイン",
+            scopeMode: .global
+        )
+        #expect(!searchResults.isEmpty)
+        let titles = searchResults.map(\.chunk.title)
+        #expect(titles.contains("Firebase認証とFlutterアプリ連携設計"))
+        #expect(titles.contains("モバイルアプリ認証基盤検討会議"))
+
+        // 4. 原本URL（webViewLink）取得の検証 (§7.4)
+        let canonicalDocId = GoogleDriveSyncService.canonicalDocumentId(accountId: account.id, externalFileId: gdoc.id)
+        let openedURL = ws.googleDriveSyncService.openGoogleDocumentInBrowser(documentId: canonicalDocId, openWithNSWorkspace: false)
+        #expect(openedURL?.absoluteString == gdoc.webViewLink)
+
+        // 5. オフライン検索の検証（APIクライアントをオフラインに設定しても検索が即座に完了すること §1.1, §13.4）
+        apiClient.isNetworkOffline = true
+        let offlineHits = ws.searchService.search(query: "Flutter", scopeMode: .global)
+        #expect(offlineHits.contains(where: { $0.chunk.title.contains("Flutter") }))
+
+        // 6. アカウント連携解除時のデータ削除と議事録データ保護 (§10.4, §13.4)
+        try ws.googleDriveSyncService.disconnectAccount(accountId: account.id)
+
+        // Google ドキュメントの検索データが削除されていること
+        #expect(try ws.embeddingService.documentRepository.fetchDocument(id: canonicalDocId) == nil)
+        #expect(try ws.googleDriveSyncService.syncRepository.fetchAccounts().isEmpty)
+        #expect(try ws.googleDriveSyncService.syncRepository.fetchSyncFolders().isEmpty)
+
+        // アプリ内議事録は一切削除されず検索可能なままであること
+        #expect(try ws.embeddingService.documentRepository.fetchDocument(id: meeting.id.uuidString) != nil)
+        let remainingHits = ws.searchService.search(query: "モバイルアプリ認証基盤検討会議", scopeMode: .global)
+        #expect(remainingHits.contains(where: { $0.chunk.title == "モバイルアプリ認証基盤検討会議" }))
     }
 }

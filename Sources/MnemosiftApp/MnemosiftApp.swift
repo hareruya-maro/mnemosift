@@ -74,6 +74,26 @@ struct MnemosiftApp: App {
                 .frame(minWidth: 1120, minHeight: 740)
         }
         .windowResizability(.contentMinSize)
+
+        // §8.3 メニューバー常駐コントロール（同期状態表示・手動同期・一時停止・環境設定）
+        MenuBarExtra("Mnemosift Google Drive", systemImage: menuBarIconName) {
+            GoogleDriveMenuBarView(workspace: workspace)
+        }
+    }
+
+    private var menuBarIconName: String {
+        switch workspace.googleDriveSyncService.syncState {
+        case .syncing:
+            return "arrow.triangle.2.circlepath.circle.fill"
+        case .paused:
+            return "pause.circle.fill"
+        case .offline:
+            return "wifi.slash"
+        case .authRequired, .error:
+            return "exclamationmark.circle.fill"
+        case .idle:
+            return "cloud.fill"
+        }
     }
 
     /// アプリアイコン画像を読み込む
@@ -209,5 +229,69 @@ struct MnemosiftApp: App {
         } catch {
             return
         }
+    }
+}
+
+// MARK: - §8.3 メニューバー常駐ビュー (`GoogleDriveMenuBarView`)
+
+public struct GoogleDriveMenuBarView: View {
+    @Bindable var workspace: AppWorkspaceController
+
+    public init(workspace: AppWorkspaceController) {
+        self.workspace = workspace
+    }
+
+    public var body: some View {
+        let syncService = workspace.googleDriveSyncService
+
+        VStack(alignment: .leading, spacing: 6) {
+            Text("☁️ Google Drive 同期ステータス")
+                .font(.headline)
+
+            HStack {
+                Text("状態: \(syncService.syncState.displayName)")
+                    .font(.subheadline)
+            }
+
+            if let last = syncService.lastSyncedAt {
+                Text("最終同期: \(last.formatted(date: .abbreviated, time: .shortened))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if let progress = syncService.syncProgress {
+                Text(progress.phaseDescription)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+
+            Button("今すぐ同期を実行", systemImage: "arrow.triangle.2.circlepath") {
+                Task {
+                    await syncService.syncAllConnectedAccounts(triggerReason: "menubar_manual")
+                }
+            }
+            .disabled(syncService.syncFolders.isEmpty || syncService.configuration.isPaused)
+
+            Button(syncService.configuration.isPaused ? "同期を再開する" : "同期を一時停止する",
+                   systemImage: syncService.configuration.isPaused ? "play.fill" : "pause.fill") {
+                syncService.setSyncPaused(!syncService.configuration.isPaused)
+            }
+
+            Divider()
+
+            Button("同期設定・フォルダ管理を開く...", systemImage: "gearshape") {
+                NSApplication.shared.activate(ignoringOtherApps: true)
+                workspace.isShowingSettingsSheet = true
+            }
+
+            Divider()
+
+            Button("Mnemosift を終了", role: .destructive) {
+                NSApplication.shared.terminate(nil)
+            }
+        }
+        .padding(8)
     }
 }

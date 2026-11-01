@@ -8,6 +8,7 @@ public enum JobType: String, Codable, CaseIterable, Sendable {
     case documentParsing = "ファイル解析"
     case documentClassification = "ファイル分類"
     case folderBulkImport = "フォルダ一括読み込み・自動同期"
+    case googleDriveSync = "Google Drive自動同期・インデックス生成"
     case embeddingGeneration = "Embedding生成"
     case vocabularyExtraction = "専門用語候補抽出"
     case modelDownload = "モデルダウンロード"

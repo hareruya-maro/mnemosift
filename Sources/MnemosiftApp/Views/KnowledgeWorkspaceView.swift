@@ -262,11 +262,29 @@ public struct KnowledgeWorkspaceView: View {
                     } label: {
                         VStack(alignment: .leading, spacing: 5) {
                             HStack {
-                                Text(docHit.documentType.displayName)
-                                    .font(.caption2.bold())
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(.blue.opacity(0.15), in: Capsule())
+                                // §7.3 出典バッジ
+                                switch docHit.sourceType {
+                                case .googleDrive:
+                                    Label("Google ドキュメント", systemImage: "cloud.fill")
+                                        .font(.caption2.bold())
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(.cyan.opacity(0.18), in: Capsule())
+                                        .foregroundStyle(.blue)
+                                case .external:
+                                    Label("ローカルファイル", systemImage: "folder.fill")
+                                        .font(.caption2.bold())
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(.secondary.opacity(0.15), in: Capsule())
+                                case .local:
+                                    Label(docHit.documentType.displayName, systemImage: "doc.text.fill")
+                                        .font(.caption2.bold())
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(.blue.opacity(0.15), in: Capsule())
+                                }
+
                                 Text(docHit.title)
                                     .font(.subheadline.bold())
                                 Spacer()
@@ -292,7 +310,18 @@ public struct KnowledgeWorkspaceView: View {
                                     Text(String(format: "Cos %.2f", cos))
                                 }
                                 Spacer()
-                                if !docHit.matchedKeywords.isEmpty {
+
+                                // §7.4 原本への遷移ボタン
+                                if docHit.sourceType == .googleDrive {
+                                    Button(action: {
+                                        _ = workspace.googleDriveSyncService.openGoogleDocumentInBrowser(documentId: docHit.documentId)
+                                    }) {
+                                        Label("ブラウザで開く", systemImage: "safari")
+                                            .font(.caption2)
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.mini)
+                                } else if !docHit.matchedKeywords.isEmpty {
                                     Text("KW: \(docHit.matchedKeywords.prefix(4).joined(separator: ", "))")
                                         .lineLimit(1)
                                 }

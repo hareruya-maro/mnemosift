@@ -21,8 +21,17 @@ public enum IndexedDocumentType: String, Codable, CaseIterable, Sendable, Identi
 public enum IndexedDocumentSourceType: String, Codable, CaseIterable, Sendable, Identifiable {
     case local = "local"
     case external = "external"
+    case googleDrive = "google_drive"
 
     public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .local: "アプリ内登録・議事録"
+        case .external: "ローカルファイル"
+        case .googleDrive: "Google ドキュメント"
+        }
+    }
 }
 
 /// §4.1 `documents.index_status` — インデックス作成状態

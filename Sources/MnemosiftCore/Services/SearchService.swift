@@ -247,6 +247,40 @@ public final class SearchService {
             results.append(SearchResultItem(chunk: enrichedChunk, breakdown: breakdown))
         }
 
+        // Google Drive ドキュメント（`sourceType == .googleDrive`）等、2階層インデックスのみに登録されている検索結果も横断検索・RAG対象へ統合 (§1.1, §7.2, §13.4)
+        let coveredSourceUUIDs = Set(results.map { $0.chunk.sourceId.uuidString })
+        for docHit in hybridDocResults where !coveredSourceUUIDs.contains(docHit.documentId) {
+            if let sourceTypeFilter, sourceTypeFilter != .document {
+                continue
+            }
+            let deterministicUUID = UUID(uuidString: docHit.documentId) ?? Self.deterministicUUID(from: docHit.documentId)
+            let snippetText = docHit.snippet.isEmpty ? docHit.summary : docHit.snippet
+            let synthChunk = KnowledgeChunk(
+                id: deterministicUUID,
+                sourceType: .document,
+                sourceId: deterministicUUID,
+                projectIds: docHit.projectIds,
+                title: docHit.title,
+                content: snippetText,
+                chunkIndex: docHit.bestChunkIndex ?? 0,
+                locationHint: docHit.sourceType == .googleDrive
+                    ? "Google ドキュメント [\(docHit.locationHintText)]"
+                    : docHit.locationHintText,
+                isDecisionOrImportant: false,
+                sourceUpdatedAt: docHit.updatedAt
+            )
+            let breakdown = SearchScoreBreakdown(
+                semanticSimilarity: docHit.cosineSimilarity ?? 0.5,
+                keywordMatchScore: min(1.0, docHit.rrfScore * 15.0),
+                filenameMatchScore: docHit.title.localizedCaseInsensitiveContains(trimmed) ? 1.0 : 0.0,
+                projectAlignmentScore: 0.0,
+                recencyScore: 0.85,
+                importanceScore: 0.0,
+                totalScore: max(0.35, docHit.combinedScore)
+            )
+            results.append(SearchResultItem(chunk: synthChunk, breakdown: breakdown))
+        }
+
         let sorted = results.sorted { $0.breakdown.totalScore > $1.breakdown.totalScore }
         let limited = Array(sorted.prefix(limit))
         self.lastSearchResults = limited
@@ -300,5 +334,21 @@ public final class SearchService {
 
     public func clearChatHistory() {
         chatMessages.removeAll()
+    }
+
+    private nonisolated static func deterministicUUID(from text: String) -> UUID {
+        var bytes = [UInt8](repeating: 0, count: 16)
+        let utf8 = Array(text.utf8)
+        for (i, b) in utf8.enumerated() {
+            bytes[i % 16] ^= b &+ UInt8(truncatingIfNeeded: i &* 31)
+        }
+        bytes[6] = (bytes[6] & 0x0F) | 0x40
+        bytes[8] = (bytes[8] & 0x3F) | 0x80
+        return UUID(uuid: (
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15]
+        ))
     }
 }

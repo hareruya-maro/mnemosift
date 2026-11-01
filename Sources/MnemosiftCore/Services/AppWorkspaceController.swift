@@ -16,6 +16,7 @@ public final class AppWorkspaceController {
     public let llmService: LLMService
     public let documentService: DocumentService
     public let searchService: SearchService
+    public let googleDriveSyncService: GoogleDriveSyncService
     public let meetingPartnerService: MeetingPartnerService
     public let benchmarkRunner: BenchmarkRunner
 
@@ -35,7 +36,11 @@ public final class AppWorkspaceController {
     public var statusBannerMessage: String?
     private var lastRealtimeFinalizedKey: String = ""
 
-    public init(databasePath: String? = nil, seedDemoDataIfEmpty: Bool = true) throws {
+    public init(
+        databasePath: String? = nil,
+        seedDemoDataIfEmpty: Bool = true,
+        googleOAuthTokenStore: (any GoogleOAuthTokenStore)? = nil
+    ) throws {
         let db = try LocalDatabase(databasePath: databasePath)
         self.database = db
 
@@ -90,6 +95,32 @@ public final class AppWorkspaceController {
             projectService: projSvc
         )
         self.searchService = searchSvc
+
+        let gdSyncSvc = try GoogleDriveSyncService(
+            database: db,
+            documentRepository: embSvc.documentRepository,
+            indexManager: embSvc.indexManager,
+            tokenStore: googleOAuthTokenStore ?? MacOSKeychainTokenStore(),
+            jobManager: jobMgr,
+            embeddingAdapterProvider: { [weak modelMgr] in
+                if let modelMgr,
+                   let model = modelMgr.model(withId: modelMgr.globalSettings.embeddingModelId) ?? modelMgr.models(for: .embedding).first {
+                    return LocalEmbeddingAdapter(model: model)
+                }
+                let fallback = AIModel(
+                    id: "embeddinggemma-2",
+                    name: "EmbeddingGemma 2",
+                    category: .embedding,
+                    version: "2.0",
+                    downloadState: .installed,
+                    runtime: .appleNaturalLanguage,
+                    requiredMemoryMB: 600,
+                    diskSizeMB: 600
+                )
+                return LocalEmbeddingAdapter(model: fallback)
+            }
+        )
+        self.googleDriveSyncService = gdSyncSvc
 
         let partnerSvc = MeetingPartnerService(
             searchService: searchSvc,
@@ -226,8 +257,15 @@ public final class AppWorkspaceController {
         statusBannerMessage = "参照元『\(citation.title)』(\(citation.locationHint)) を表示しています"
     }
 
-    /// ローカルAIドキュメント検索機能 実装仕様書 v1.0 (§10): ドキュメント単位の検索結果から元文書・該当チャンク位置（文字オフセット/発言時刻）へジャンプする
+    /// ローカルAIドキュメント検索機能 実装仕様書 v1.0 (§10) & Google Drive仕様書 (§7.4): ドキュメント単位の検索結果から元文書・該当チャンク位置（文字オフセット/発言時刻）またはGoogleドキュメント原本へジャンプする
     public func jumpToDocumentSearchResult(_ result: DocumentSearchResult) {
+        if result.sourceType == .googleDrive {
+            if googleDriveSyncService.openGoogleDocumentInBrowser(documentId: result.documentId) != nil {
+                statusBannerMessage = "Googleドキュメント『\(result.title)』をブラウザで開きました"
+                return
+            }
+        }
+
         if let start = result.startOffset, let end = result.endOffset {
             highlightedCharacterRange = (start, end)
         } else {
