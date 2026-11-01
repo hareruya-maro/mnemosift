@@ -31,6 +31,7 @@ public final class AppWorkspaceController {
     public var selectedMeetingId: UUID?
     public var selectedDocumentId: UUID?
     public var highlightedSegmentId: UUID?
+    public var highlightedCharacterRange: (start: Int, end: Int)?
     public var statusBannerMessage: String?
     private var lastRealtimeFinalizedKey: String = ""
 
@@ -162,6 +163,20 @@ public final class AppWorkspaceController {
                 try? await self.seedInitialWorkspaceSample()
             }
         } else {
+            // 既存DB上のアプリ登録ドキュメント・議事録が2階層インデックスに未登録であれば自動同期
+            for doc in docSvc.documents {
+                if (try? embSvc.documentRepository.fetchDocument(id: doc.id.uuidString)) == nil {
+                    let pids = projSvc.projectIds(forDocument: doc.id)
+                    _ = try? embSvc.indexDocument(doc, projectIds: pids)
+                }
+            }
+            for meeting in llmSvc.meetings {
+                if (try? embSvc.documentRepository.fetchDocument(id: meeting.id.uuidString)) == nil {
+                    try? embSvc.indexMeeting(meeting)
+                }
+            }
+            searchSvc.refreshStorageAndSpeedMetrics()
+
             self.activeTranscriptId = sttSvc.transcripts.first?.id
             self.selectedMeetingId = llmSvc.meetings.first?.id
             self.selectedDocumentId = docSvc.documents.first?.id
@@ -209,6 +224,34 @@ public final class AppWorkspaceController {
             refreshMeetingPartnerState()
         }
         statusBannerMessage = "参照元『\(citation.title)』(\(citation.locationHint)) を表示しています"
+    }
+
+    /// ローカルAIドキュメント検索機能 実装仕様書 v1.0 (§10): ドキュメント単位の検索結果から元文書・該当チャンク位置（文字オフセット/発言時刻）へジャンプする
+    public func jumpToDocumentSearchResult(_ result: DocumentSearchResult) {
+        if let start = result.startOffset, let end = result.endOffset {
+            highlightedCharacterRange = (start, end)
+        } else {
+            highlightedCharacterRange = nil
+        }
+
+        if let uuid = UUID(uuidString: result.documentId) {
+            if documentService.documents.contains(where: { $0.id == uuid }) {
+                selectedDocumentId = uuid
+                selectedSection = .files
+                activeMode = .knowledgeHub
+            } else if llmService.meetings.contains(where: { $0.id == uuid }) {
+                selectedDocumentId = nil
+                selectedMeetingId = uuid
+                selectedSection = .meetings
+                activeMode = .knowledgeHub
+            } else if sttService.transcripts.contains(where: { $0.id == uuid }) {
+                activeTranscriptId = uuid
+                selectedSection = .recording
+                activeMode = .meetingPartner
+                refreshMeetingPartnerState()
+            }
+        }
+        statusBannerMessage = "参照元『\(result.title)』(\(result.locationHintText)) を開きました"
     }
 
     public func jumpToTranscript(from meeting: Meeting, highlightSegmentId: UUID? = nil) {

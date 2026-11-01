@@ -539,8 +539,13 @@ struct MnemosiftTests {
         // 同一内容が重複して飛んできた場合でも1件に抑えられることを検証
         ws.recordingService.onFinalizedUtterance?(formattedSample, 27.0, 28.0)
 
-        // 少し待機して非同期タスク完了を待つ
-        try await Task.sleep(for: .milliseconds(350))
+        // MainActor キュー上の非同期タスク完了を待機（並列テスト実行時でも確実に完了を待つ）
+        for _ in 0..<30 {
+            if !ws.sttService.segments(for: tr.id).isEmpty && ws.sttService.currentProvisionalSegment == nil {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
 
         let segments = ws.sttService.segments(for: tr.id)
         #expect(segments.count == 1)
@@ -609,5 +614,350 @@ struct MnemosiftTests {
         try ws.modelManager.deleteModelFromDisk(id: gemmaStandaloneId)
         let afterDelete = try #require(ws.modelManager.model(withId: gemmaStandaloneId))
         #expect(afterDelete.downloadState == .notInstalled)
+    }
+
+    @Test("11. ローカルAIドキュメント検索仕様書 §6 & §16.1: 日本語形態素解析・重要キーワード抽出・記号技術用語(C++/OAuth2/SwiftUI)・表記ゆれ・2文字語検索の検証")
+    func testKeywordSearchMorphologyAndSymbolTechTerms() async throws {
+        let ws = try makeIsolatedController()
+        let analyzer = NaturalLanguageTextAnalyzer()
+        let kwExtractor = ImportantKeywordExtractor(analyzer: analyzer)
+
+        // 1. フィラー（「えーと」「あの」）除外と重要キーワード抽出数（文書5〜15語、チャンク3〜8語）の検証
+        let sampleMeetingText = """
+        えーと、あの、本日の認証基盤会議では田中さんが OAuth2 と SwiftUI および C++ モジュールの連携仕様を提案しました。
+        レスポンスを 30% 改善し、10秒かかっていたログイン処理を高速化することが決定しました。
+        """
+        let docKeywords = kwExtractor.extractDocumentKeywords(
+            from: sampleMeetingText,
+            title: "認証基盤とC++高速化会議",
+            minCount: 5,
+            maxCount: 15
+        )
+        #expect(docKeywords.count >= 5 && docKeywords.count <= 15)
+        #expect(!docKeywords.contains("えーと"))
+        #expect(!docKeywords.contains("あの"))
+        #expect(docKeywords.contains("oauth2") || docKeywords.contains("swiftui") || docKeywords.contains("c++"))
+        #expect(docKeywords.contains("田中"))
+
+        let chunkKeywords = kwExtractor.extractChunkKeywords(
+            from: sampleMeetingText,
+            title: "認証基盤とC++高速化会議",
+            minCount: 3,
+            maxCount: 8
+        )
+        #expect(chunkKeywords.count >= 3 && chunkKeywords.count <= 8)
+
+        // 2. アプリ内ドキュメント登録と §16.1 各種キーワード検索の検証
+        let tempDir = FileManager.default.temporaryDirectory
+        let docCppURL = tempDir.appendingPathComponent("cpp_dsp_engine.md")
+        let docCppText = "# C++ オーディオエンジン仕様\nSIMD最適化された C++ コードにより 10ミリ秒 以下の低遅延処理を実現する。"
+        try docCppText.write(to: docCppURL, atomically: true, encoding: .utf8)
+        let docCpp = try await ws.documentService.registerFile(url: docCppURL, storageMode: .copiedToManagedStorage, explicitContent: docCppText)
+
+        let docCLegacyURL = tempDir.appendingPathComponent("c_posix_wrapper.md")
+        let docCLegacyText = "# C言語 POSIXラッパー\n標準C言語のファイルディスクリプタ制御。"
+        try docCLegacyText.write(to: docCLegacyURL, atomically: true, encoding: .utf8)
+        let docCLegacy = try await ws.documentService.registerFile(url: docCLegacyURL, storageMode: .copiedToManagedStorage, explicitContent: docCLegacyText)
+
+        let docAuthURL = tempDir.appendingPathComponent("firebase_oauth2_swiftui.md")
+        let docAuthText = "# Firebase Auth & OAuth2 設計\nSwiftUI 画面からサインイン（ログイン）を実行し、田中さんが 30% の高速化を確認した。"
+        try docAuthText.write(to: docAuthURL, atomically: true, encoding: .utf8)
+        let docAuth = try await ws.documentService.registerFile(url: docAuthURL, storageMode: .copiedToManagedStorage, explicitContent: docAuthText)
+
+        // (a) 記号を含む技術用語 `C++` で `docCpp` が1位になり、単なる `C` の文書と混同しないこと
+        let cppHits = ws.searchService.searchDocuments(query: "C++", mode: .ftsOnly)
+        #expect(cppHits.first?.documentId == docCpp.id.uuidString)
+        #expect(!cppHits.contains(where: { $0.documentId == docCLegacy.id.uuidString }))
+
+        // (b) `OAuth2`, `SwiftUI` の検索
+        let oauthHits = ws.searchService.searchDocuments(query: "OAuth2 SwiftUI", mode: .hybrid)
+        #expect(oauthHits.first?.documentId == docAuth.id.uuidString)
+
+        // (c) 表記ゆれ（本文は「サインイン」でも「ログイン」でヒット）
+        let synonymHits = ws.searchService.searchDocuments(query: "Firebase ログイン", mode: .ftsOnly)
+        #expect(synonymHits.first?.documentId == docAuth.id.uuidString)
+
+        // (d) 日本語2文字語（「田中」）と数値単位（「30%」）の検索
+        let twoCharHits = ws.searchService.searchDocuments(query: "田中 30%", mode: .ftsOnly)
+        #expect(twoCharHits.first?.documentId == docAuth.id.uuidString)
+    }
+
+    @Test("12. ローカルAIドキュメント検索仕様書 §16.2 & §16.3: 意味検索・長文の不当優遇防止・5つの意味の区別（採用/不採用、提案/決定、明/暗、予定/完了、重大/軽微）の検証")
+    func testSemanticSearchAndFiveSemanticDistinctionPairs() async throws {
+        let ws = try makeIsolatedController()
+        let embModel = try #require(ws.modelManager.model(withId: "emb-multilingual-e5-small-384d") ?? ws.modelManager.models(for: .embedding).first)
+        let adapter = LocalEmbeddingAdapter(model: embModel)
+        #expect(adapter.dimensions == 384)
+
+        let idxMgr = ws.embeddingService.indexManager
+        let hybridSvc = ws.searchService.hybridSearchService
+
+        // ペア1: 採用した vs 採用しなかった（見送った）
+        _ = try idxMgr.indexDocument(
+            id: "pair1-adopted",
+            title: "Appleログイン採用決定議事録",
+            rawText: "プライバシー保護とiOS審査準拠のため、Appleログインを採用することになった（採用を決定した）。",
+            type: .meeting,
+            embeddingAdapter: adapter
+        )
+        _ = try idxMgr.indexDocument(
+            id: "pair1-rejected",
+            title: "社内管理ツール認証検討（Appleログイン不採用）",
+            rawText: "Windows専用端末のみで利用するため、Appleログインは採用しなかった（導入を見送った）。",
+            type: .meeting,
+            embeddingAdapter: adapter
+        )
+
+        // ペア2: 提案された（検討中） vs 決定された
+        _ = try idxMgr.indexDocument(
+            id: "pair2-proposed",
+            title: "先月の企画会議（田中さんの機能提案）",
+            rawText: "先月、田中さんが自動ショートカット生成機能を提案した。現在は検討中の段階である。",
+            type: .meeting,
+            participants: ["田中"],
+            embeddingAdapter: adapter
+        )
+        _ = try idxMgr.indexDocument(
+            id: "pair2-decided",
+            title: "開発委員会（自動ショートカット機能の正式決定）",
+            rawText: "自動ショートカット生成機能の導入が本日の会議で正式に決定された（確定した）。",
+            type: .meeting,
+            embeddingAdapter: adapter
+        )
+
+        // ペア3: 明るい vs 暗い
+        _ = try idxMgr.indexDocument(
+            id: "pair3-bright",
+            title: "デザイン検討会議（明るい配色）",
+            rawText: "昼間の視認性を高めるため、白基調でデザインを明るくするという意見が出た（ライトモード）。",
+            type: .meeting,
+            embeddingAdapter: adapter
+        )
+        _ = try idxMgr.indexDocument(
+            id: "pair3-dark",
+            title: "デザイン検討会議（暗い配色）",
+            rawText: "夜間の目の負担を軽減するため、黒基調でデザインを暗くするダークモードとした。",
+            type: .meeting,
+            embeddingAdapter: adapter
+        )
+
+        // ペア4: 改善予定 vs 改善完了
+        _ = try idxMgr.indexDocument(
+            id: "pair4-planned",
+            title: "検索メモリ削減タスク（改善予定）",
+            rawText: "Int8量子化によるメモリ削減は来月改善予定（対応予定）の計画項目です。",
+            type: .document,
+            embeddingAdapter: adapter
+        )
+        _ = try idxMgr.indexDocument(
+            id: "pair4-completed",
+            title: "検索メモリ削減タスク（改善完了）",
+            rawText: "チャンク差分更新によるメモリ削減は先週すでに改善完了（対応完了）しました。",
+            type: .document,
+            embeddingAdapter: adapter
+        )
+
+        // ペア5: 重大な障害 vs 軽微な障害
+        _ = try idxMgr.indexDocument(
+            id: "pair5-critical",
+            title: "決済システム障害報告（重大）",
+            rawText: "全ユーザーの決済が2時間全面停止する重大な障害（クリティカルインシデント）が発生した。",
+            type: .document,
+            embeddingAdapter: adapter
+        )
+        _ = try idxMgr.indexDocument(
+            id: "pair5-minor",
+            title: "アイコン表示ずれ報告（軽微）",
+            rawText: "設定画面のツールチップが2pxずれる軽微な障害（マイナーな不具合）が確認された。",
+            type: .document,
+            embeddingAdapter: adapter
+        )
+
+        // 1. ペア1検証（採用した vs 採用しなかった）
+        let adoptedRes = hybridSvc.searchDocuments(query: "Appleログインを採用することになった理由", mode: .hybrid, embeddingAdapter: adapter)
+        #expect(adoptedRes.first?.documentId == "pair1-adopted")
+
+        let rejectedRes = hybridSvc.searchDocuments(query: "Appleログインを採用しなかった（見送った）会議", mode: .hybrid, embeddingAdapter: adapter)
+        #expect(rejectedRes.first?.documentId == "pair1-rejected")
+
+        // 2. ペア2検証（提案された vs 決定された）
+        let proposedRes = hybridSvc.searchDocuments(query: "先月、田中さんが提案した機能", mode: .hybrid, embeddingAdapter: adapter)
+        #expect(proposedRes.first?.documentId == "pair2-proposed")
+
+        let decidedRes = hybridSvc.searchDocuments(query: "自動ショートカット機能の導入が正式に決定された会議", mode: .hybrid, embeddingAdapter: adapter)
+        #expect(decidedRes.first?.documentId == "pair2-decided")
+
+        // 3. ペア3検証（明るい vs 暗い）
+        let brightRes = hybridSvc.searchDocuments(query: "デザインを明るくするという意見が出た会議", mode: .hybrid, embeddingAdapter: adapter)
+        #expect(brightRes.first?.documentId == "pair3-bright")
+
+        let darkRes = hybridSvc.searchDocuments(query: "デザインを暗くするダークモードの会議", mode: .hybrid, embeddingAdapter: adapter)
+        #expect(darkRes.first?.documentId == "pair3-dark")
+
+        // 4. ペア4検証（改善予定 vs 改善完了）
+        let plannedRes = hybridSvc.searchDocuments(query: "来月改善予定のメモリ削減タスク", mode: .hybrid, embeddingAdapter: adapter)
+        #expect(plannedRes.first?.documentId == "pair4-planned")
+
+        let completedRes = hybridSvc.searchDocuments(query: "すでに改善完了したメモリ削減タスク", mode: .hybrid, embeddingAdapter: adapter)
+        #expect(completedRes.first?.documentId == "pair4-completed")
+
+        // 5. ペア5検証（重大な障害 vs 軽微な障害）
+        let criticalRes = hybridSvc.searchDocuments(query: "全面停止した重大な障害の報告", mode: .hybrid, embeddingAdapter: adapter)
+        #expect(criticalRes.first?.documentId == "pair5-critical")
+
+        let minorRes = hybridSvc.searchDocuments(query: "影響が小さい軽微な障害の報告", mode: .hybrid, embeddingAdapter: adapter)
+        #expect(minorRes.first?.documentId == "pair5-minor")
+    }
+
+    @Test("13. ローカルAIドキュメント検索仕様書 §11 & §16.4: 差分インデックス更新（既存Embedding再利用）・未変更スキップ・完全削除・エラー再試行・マルチバイト文字オフセット/時刻整合性の検証")
+    func testDifferentialIndexingDeletionRetryAndMultibyteOffsets() async throws {
+        let tempDBPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("test-diff-index-\(UUID().uuidString).sqlite3").path
+        defer { try? FileManager.default.removeItem(atPath: tempDBPath) }
+
+        let ws = try AppWorkspaceController(databasePath: tempDBPath, seedDemoDataIfEmpty: false)
+        let embModel = try #require(ws.modelManager.model(withId: "emb-multilingual-e5-small-384d") ?? ws.modelManager.models(for: .embedding).first)
+        let adapter = LocalEmbeddingAdapter(model: embModel)
+        let idxMgr = ws.embeddingService.indexManager
+        let repo = ws.embeddingService.documentRepository
+
+        // マルチバイト文字（日本語・絵文字・タイムスタンプ）を含む複数セクション文書
+        let initialText = """
+        # 第1章：Firebase認証の設計 🚀
+        [00:15-00:45] 佐藤: Firebase Auth を用いたマルチファクタ認証のフローを定義します。
+
+        # 第2章：パフォーマンス計測とキャッシュ
+        [01:10-01:50] 鈴木: SQLite FTS5 とベクター検索のクエリ応答時間を20ミリ秒以下に抑えます。
+        """
+
+        // 1. 新規登録
+        let outcome1 = try idxMgr.indexDocument(
+            id: "doc-lifecycle-1",
+            title: "マルチバイト設計議事録",
+            rawText: initialText,
+            type: .meeting,
+            embeddingAdapter: adapter
+        )
+        #expect(!outcome1.wasSkippedUnchanged)
+        #expect(outcome1.chunkCount >= 2)
+        #expect(outcome1.generatedVectorCount == outcome1.chunkCount + 1) // 文書要約1 + チャンクN
+
+        // 2. マルチバイト文字の startOffset / endOffset と startTimeMs / endTimeMs の厳密検証 (§4.3, §16.4 #7)
+        let storedChunks = try repo.fetchDocumentChunks(documentId: "doc-lifecycle-1")
+        #expect(storedChunks.count == outcome1.chunkCount)
+        for chunk in storedChunks {
+            let startIdx = initialText.index(initialText.startIndex, offsetBy: chunk.startOffset)
+            let endIdx = initialText.index(initialText.startIndex, offsetBy: chunk.endOffset)
+            let slicedFromOriginal = String(initialText[startIdx..<endIdx])
+            #expect(slicedFromOriginal == chunk.text)
+        }
+        #expect(storedChunks.first?.startTimeMs == 15_000)
+        #expect(storedChunks.first?.endTimeMs == 45_000)
+
+        // 3. 同一 content_hash で再登録した場合にスキップされること (§5.1 #2, §16.4 #3)
+        let outcome2 = try idxMgr.indexDocument(
+            id: "doc-lifecycle-1",
+            title: "マルチバイト設計議事録",
+            rawText: initialText,
+            type: .meeting,
+            embeddingAdapter: adapter
+        )
+        #expect(outcome2.wasSkippedUnchanged)
+        #expect(outcome2.generatedVectorCount == 0)
+
+        // 4. 一部チャンクのみ更新した場合、未変更チャンク（第1章）のEmbeddingベクターが再利用されること (§11.2, §16.4 #2)
+        let updatedText = """
+        # 第1章：Firebase認証の設計 🚀
+        [00:15-00:45] 佐藤: Firebase Auth を用いたマルチファクタ認証のフローを定義します。
+
+        # 第2章：パフォーマンス計測とキャッシュ（改訂版）
+        [01:10-02:00] 鈴木: Redisキャッシュを廃止し、ローカルオンメモリのLRUキャッシュへ変更しました。
+        """
+        let outcome3 = try idxMgr.indexDocument(
+            id: "doc-lifecycle-1",
+            title: "マルチバイト設計議事録",
+            rawText: updatedText,
+            type: .meeting,
+            embeddingAdapter: adapter
+        )
+        #expect(!outcome3.wasSkippedUnchanged)
+        #expect(outcome3.reusedVectorCount >= 1)
+
+        // 古い内容（「20ミリ秒以下」）で検索してもヒットせず、新しい内容（「LRUキャッシュ」）でヒットすること
+        let newHits = ws.searchService.hybridSearchService.searchDocuments(query: "LRUキャッシュ", mode: .ftsOnly, embeddingAdapter: adapter)
+        #expect(newHits.first?.documentId == "doc-lifecycle-1")
+        let oldHits = ws.searchService.hybridSearchService.searchDocuments(query: "20ミリ秒以下", mode: .ftsOnly, embeddingAdapter: adapter)
+        #expect(!oldHits.contains(where: { $0.documentId == "doc-lifecycle-1" }))
+
+        // 5. External Content FTS5 の整合性チェックと再構築 (§4.5)
+        #expect(try repo.verifyFTS5Integrity())
+        try repo.rebuildFTS5Index()
+        #expect(try repo.verifyFTS5Integrity())
+
+        // 6. インデックス作成失敗時のエラーステータス記録と再試行による復旧 (§14, §16.4 #5)
+        #expect(throws: (any Error).self) {
+            try idxMgr.indexDocument(
+                id: "doc-fail-retry",
+                title: "一時失敗テスト文書",
+                rawText: "インデックス失敗からの再試行リカバリを検証するテキストです。",
+                type: .document,
+                embeddingAdapter: adapter,
+                simulateFailureForTesting: true
+            )
+        }
+        let failedDoc = try #require(try repo.fetchDocument(id: "doc-fail-retry"))
+        #expect(failedDoc.indexStatus == .error)
+
+        let retriedCount = try idxMgr.retryPendingOrFailedDocuments(embeddingAdapter: adapter)
+        #expect(retriedCount == 1)
+        let recoveredDoc = try #require(try repo.fetchDocument(id: "doc-fail-retry"))
+        #expect(recoveredDoc.indexStatus == .ready)
+
+        // 7. アプリ再起動シミュレーション（同一SQLiteパスで別インスタンスを起動してもインデックスと検索が維持されること §16.4 #6）
+        let restartedWS = try AppWorkspaceController(databasePath: tempDBPath, seedDemoDataIfEmpty: false)
+        let persistedHits = restartedWS.searchService.hybridSearchService.searchDocuments(
+            query: "LRUキャッシュ",
+            mode: .hybrid,
+            embeddingAdapter: adapter
+        )
+        #expect(persistedHits.first?.documentId == "doc-lifecycle-1")
+
+        // 8. ドキュメント完全削除後の残存ゼロ検証 (§11.3, §16.4 #4)
+        try repo.deleteDocumentAndAllSearchArtifacts(documentId: "doc-lifecycle-1")
+        #expect(try repo.fetchDocument(id: "doc-lifecycle-1") == nil)
+        #expect(try repo.fetchDocumentContent(documentId: "doc-lifecycle-1") == nil)
+        #expect(try repo.fetchDocumentChunks(documentId: "doc-lifecycle-1").isEmpty)
+        #expect(try repo.fetchSearchUnits(documentId: "doc-lifecycle-1").isEmpty)
+        let afterDeleteHits = ws.searchService.hybridSearchService.searchDocuments(query: "LRUキャッシュ", mode: .hybrid, embeddingAdapter: adapter)
+        #expect(!afterDeleteHits.contains(where: { $0.documentId == "doc-lifecycle-1" }))
+    }
+
+    @Test("14. ローカルAIドキュメント検索仕様書 §12, §13, §16.5: 52件の検索クエリ評価スイートによる FTS5のみ / ベクター検索のみ / ハイブリッド検索 (RRF) の比較評価と容量・速度測定")
+    func testFiftyPlusQueriesQualityEvaluationAndStorageSpeedMetrics() throws {
+        let report = try HybridSearchService.runSearchQualityEvaluationSuite()
+
+        // 50件以上（52件）の評価クエリが実行されていること
+        #expect(report.totalQueries >= 50)
+        #expect(report.totalDocuments == 20)
+
+        // ハイブリッド検索が FTS5 のみ・ベクター検索のみ以上の総合性能（Recall@5 >= 95%, MRR >= 0.85, 意味の区別精度 >= 90%）を達成していること
+        #expect(report.hybridMetrics.recallAt5 >= 0.95)
+        #expect(report.hybridMetrics.mrr >= 0.85)
+        #expect(report.hybridMetrics.semanticDistinctionAccuracy >= 0.90)
+        #expect(report.hybridMetrics.recallAt5 >= report.ftsOnlyMetrics.recallAt5)
+        #expect(report.hybridMetrics.recallAt5 >= report.vectorOnlyMetrics.recallAt5)
+
+        // 検索速度が目標（通常 100ms 以内）を大きく下回る高速動作であること (§13.1)
+        #expect(report.hybridMetrics.averageSearchMs < 100.0)
+
+        // データ容量メトリクスが正しく計測され、1文書あたり平均容量も省容量（§12.2, §12.3）であること
+        let storage = report.storageMetrics
+        #expect(storage.documentCount == 20)
+        #expect(storage.readyDocumentCount == 20)
+        #expect(storage.chunkCount >= 20)
+        #expect(storage.vectorCount >= 40)
+        #expect(storage.activeEmbeddingDimension == 384)
+        #expect(storage.vectorBlobBytes == Int64(storage.vectorCount * 384 * 4))
+        #expect(storage.averageBytesPerDocument > 0 && storage.averageBytesPerDocument < 35_000)
     }
 }

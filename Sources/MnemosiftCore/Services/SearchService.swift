@@ -1,11 +1,12 @@
 import Foundation
 import Observation
 
-/// 仕様書 §8: AI検索・マルチファクターランキング・RAGチャットサービス
+/// 仕様書 §8 & ローカルAIドキュメント検索機能 実装仕様書 v1.0 (§7〜§10, §12, §13, §16):
+/// AIハイブリッド検索（FTS5 BM25 + ベクター検索 + RRF統合）・マルチファクターランキング・RAGチャットサービス
 /// - 3つの検索範囲モード（全体検索、プロジェクト優先検索、プロジェクト限定検索）を厳密に区別
-/// - 意味的類似度・キーワード一致・ファイル名一致・プロジェクト一致・更新日時減衰・重要度を考慮し、
-///   プロジェクト一致だけで古い資料が優先されることを防ぐ
-/// - AIチャット回答に参照元を紐づけ、該当ファイル・議事録への移動を可能にする
+/// - 2階層インデックス（文書要約＋チャンク）と Reciprocal Rank Fusion (`k = 60`) によるドキュメント単位ハイブリッド検索を提供
+/// - 意味的類似度・キーワード一致・ファイル名一致・プロジェクト一致・更新日時減衰・重要度・意味極性（肯定/否定・決定/検討・明/暗）を考慮
+/// - 検索結果およびAIチャット回答に参照元・文字オフセット・発言時刻を紐づけ、該当ファイル・議事録への移動を可能にする
 @Observable
 @MainActor
 public final class SearchService {
@@ -15,7 +16,13 @@ public final class SearchService {
     private let embeddingService: EmbeddingService
     private let projectService: ProjectService
 
+    public let hybridSearchService: HybridSearchService
+
+    public var selectedHybridMode: HybridSearchExecutionMode = .hybrid
     public private(set) var lastSearchResults: [SearchResultItem] = []
+    public private(set) var lastDocumentSearchResults: [DocumentSearchResult] = []
+    public private(set) var lastStorageAndSpeedMetrics: IndexStorageAndSpeedMetrics = IndexStorageAndSpeedMetrics()
+    public private(set) var lastEvaluationReport: SearchQualityEvaluationReport?
     public private(set) var chatMessages: [ChatMessage] = []
 
     public init(
@@ -30,9 +37,76 @@ public final class SearchService {
         self.jobManager = jobManager
         self.embeddingService = embeddingService
         self.projectService = projectService
+        self.hybridSearchService = HybridSearchService(
+            repository: embeddingService.documentRepository,
+            indexManager: embeddingService.indexManager
+        )
+        self.refreshStorageAndSpeedMetrics()
     }
 
-    /// ハイブリッド検索（ファイル名 + FTS5全文 + キーワード + Embedding意味検索 + マルチファクターランキング）
+    /// 仕様書 v1.0 (§7, §8, §9, §10): 2階層インデックス + FTS5 BM25 + ベクター検索 + RRF (`k=60`) によるドキュメント単位ハイブリッド検索
+    @discardableResult
+    public func searchDocuments(
+        query: String,
+        mode: HybridSearchExecutionMode? = nil,
+        filter: DocumentSearchFilter = DocumentSearchFilter(),
+        limit: Int = 20
+    ) -> [DocumentSearchResult] {
+        let embModel = modelManager.model(withId: modelManager.globalSettings.embeddingModelId)
+            ?? modelManager.models(for: .embedding).first!
+        let embAdapter = LocalEmbeddingAdapter(model: embModel)
+        let activeMode = mode ?? selectedHybridMode
+
+        let docResults = hybridSearchService.searchDocuments(
+            query: query,
+            mode: activeMode,
+            filter: filter,
+            embeddingAdapter: embAdapter,
+            limit: limit
+        )
+        self.lastDocumentSearchResults = docResults
+        self.refreshStorageAndSpeedMetrics()
+        return docResults
+    }
+
+    /// §12.3 & §13.2 容量・速度メトリクスを最新状態に更新して取得する
+    @discardableResult
+    public func refreshStorageAndSpeedMetrics() -> IndexStorageAndSpeedMetrics {
+        let embModel = modelManager.model(withId: modelManager.globalSettings.embeddingModelId)
+            ?? modelManager.models(for: .embedding).first!
+        let embAdapter = LocalEmbeddingAdapter(model: embModel)
+        let metrics = embeddingService.documentRepository.computeStorageMetrics(
+            activeEmbeddingModelId: embModel.id,
+            activeEmbeddingDimension: embAdapter.dimensions,
+            lastIndexingDurationMs: embeddingService.indexManager.lastIndexingDurationMs,
+            lastSearchTiming: hybridSearchService.lastSearchTiming
+        )
+        self.lastStorageAndSpeedMetrics = metrics
+        return metrics
+    }
+
+    /// §11.4 インデックス全体の再生成を実行する
+    @discardableResult
+    public func regenerateAllSearchIndexes() throws -> Int {
+        let embModel = modelManager.model(withId: modelManager.globalSettings.embeddingModelId)
+            ?? modelManager.models(for: .embedding).first!
+        let embAdapter = LocalEmbeddingAdapter(model: embModel)
+        let count = try embeddingService.indexManager.regenerateAllIndexes(embeddingAdapter: embAdapter)
+        refreshStorageAndSpeedMetrics()
+        return count
+    }
+
+    /// §16.5 50件以上の検索クエリと正解文書による検索品質評価スイート（FTS5のみ / ベクター検索のみ / ハイブリッド検索の比較）を実行する
+    @discardableResult
+    public func runQualityEvaluationSuite() throws -> SearchQualityEvaluationReport {
+        let embModel = modelManager.model(withId: modelManager.globalSettings.embeddingModelId)
+            ?? modelManager.models(for: .embedding).first!
+        let report = try HybridSearchService.runSearchQualityEvaluationSuite(embeddingModel: embModel)
+        self.lastEvaluationReport = report
+        return report
+    }
+
+    /// ハイブリッド検索（ファイル名 + FTS5全文 + キーワード + Embedding意味検索 + RRF連携マルチファクターランキング）
     public func search(
         query: String,
         scopeMode: SearchScopeMode,
@@ -43,7 +117,29 @@ public final class SearchService {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             self.lastSearchResults = []
+            self.lastDocumentSearchResults = []
             return []
+        }
+
+        // 1. 2階層 RRF ハイブリッド検索も同時に実行してドキュメント単位結果・位置オフセット・速度メトリクスを更新
+        let docTypeFilter: IndexedDocumentType? = switch sourceTypeFilter {
+        case .document: .document
+        case .meetingMinutes, .transcriptSegment: .meeting
+        case nil: nil
+        }
+        let hybridDocResults = searchDocuments(
+            query: trimmed,
+            mode: selectedHybridMode,
+            filter: DocumentSearchFilter(
+                documentType: docTypeFilter,
+                scopeMode: scopeMode,
+                targetProjectId: targetProjectId
+            ),
+            limit: limit
+        )
+        var hybridRRFByDocId: [String: DocumentSearchResult] = [:]
+        for item in hybridDocResults {
+            hybridRRFByDocId[item.documentId] = item
         }
 
         let embModel = modelManager.model(withId: modelManager.globalSettings.embeddingModelId)
@@ -75,14 +171,15 @@ public final class SearchService {
 
             // 3. Embedding 意味的類似度
             let semanticScore: Double
-            if let embRecord = embeddingService.embeddingsByChunkId[chunk.id] {
+            if let embRecord = embeddingService.embeddingsByChunkId[chunk.id],
+               embRecord.vector.count == queryVector.count {
                 semanticScore = LocalEmbeddingAdapter.cosineSimilarity(queryVector, embRecord.vector)
             } else {
                 let fallbackVec = embAdapter.generateEmbedding(for: "\(chunk.title) \(chunk.content)")
                 semanticScore = LocalEmbeddingAdapter.cosineSimilarity(queryVector, fallbackVec)
             }
 
-            // 4. キーワード一致 & FTS5 スコア
+            // 4. キーワード一致 & FTS5 スコア & 2階層RRFハイブリッド検索スコア反映
             let lowerContent = chunk.content.lowercased()
             let lowerTitle = chunk.title.lowercased()
             var directTermHits = 0
@@ -93,11 +190,12 @@ public final class SearchService {
             }
             let termRatio = queryTerms.isEmpty ? 0.0 : Double(directTermHits) / Double(queryTerms.count)
             let ftsScore = ftsScores[chunk.id] ?? 0.0
-            let keywordScore = max(termRatio, ftsScore)
+            let rrfBonus = (hybridRRFByDocId[chunk.sourceId.uuidString]?.rrfScore ?? 0.0) * 15.0
+            let keywordScore = min(1.0, max(termRatio, ftsScore, rrfBonus))
             let filenameScore = queryTerms.isEmpty ? 0.0 : Double(titleHits) / Double(queryTerms.count)
 
             // 最低限の関連性チェック（意味的類似度またはキーワード・ファイル名一致が必要）
-            guard semanticScore >= 0.25 || keywordScore > 0.0 || filenameScore > 0.0 else {
+            guard semanticScore >= 0.20 || keywordScore > 0.0 || filenameScore > 0.0 else {
                 continue
             }
 
@@ -138,7 +236,15 @@ public final class SearchService {
                 totalScore: totalScore
             )
 
-            results.append(SearchResultItem(chunk: chunk, breakdown: breakdown))
+            // 2階層ハイブリッド検索で算出された文字オフセット・時刻ヒントがあれば locationHint を補強
+            var enrichedChunk = chunk
+            if let docHit = hybridRRFByDocId[chunk.sourceId.uuidString],
+               !docHit.locationHintText.isEmpty,
+               !enrichedChunk.locationHint.contains("文字位置") {
+                enrichedChunk.locationHint = "\(chunk.locationHint) [\(docHit.locationHintText)]"
+            }
+
+            results.append(SearchResultItem(chunk: enrichedChunk, breakdown: breakdown))
         }
 
         let sorted = results.sorted { $0.breakdown.totalScore > $1.breakdown.totalScore }

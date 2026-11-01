@@ -300,7 +300,7 @@ public final class ModelManager {
             // Embedding Models
             AIModel(
                 id: "emb-embedding-gemma-2",
-                name: "EmbeddingGemma 2",
+                name: "EmbeddingGemma 2 (384d Local Search)",
                 category: .embedding,
                 version: "2.0.0",
                 downloadState: .installed,
@@ -310,9 +310,25 @@ public final class ModelManager {
                 streamingCapability: .batchOnly,
                 supportsCustomVocabulary: false,
                 diskSizeMB: 580,
-                endpointOrPath: "embeddinggemma2:latest",
+                endpointOrPath: "embeddinggemma2:384d",
                 license: "Gemma Terms",
-                notes: "標準Embeddingモデル（256次元正規化ベクトル）。日本語意味検索・RAGに最適化。"
+                notes: "標準ローカルEmbeddingモデル（384次元 Float32 正規化ベクトル）。日本語意味検索・2階層ハイブリッドRAGに最適化。"
+            ),
+            AIModel(
+                id: "emb-multilingual-e5-small-384d",
+                name: "Multilingual-E5-Small 384d (MLX / CoreML)",
+                category: .embedding,
+                version: "1.1.0",
+                downloadState: .installed,
+                runtime: .mlxLLM,
+                requiredMemoryMB: 280,
+                supportsJapanese: true,
+                streamingCapability: .batchOnly,
+                supportsCustomVocabulary: false,
+                diskSizeMB: 240,
+                endpointOrPath: "intfloat/multilingual-e5-small#384d",
+                license: "MIT",
+                notes: "検索用途に特化した軽量384次元多言語Embeddingモデル（1ベクター 1,536 bytes）。"
             ),
             AIModel(
                 id: "emb-apple-nl-hybrid",
@@ -328,7 +344,7 @@ public final class ModelManager {
                 diskSizeMB: 0,
                 endpointOrPath: "system://NLEmbedding-ja",
                 license: "Apple System",
-                notes: "OS内蔵の単語分散表現と文字N-gramを組み合わせた省メモリEmbeddingモデル。"
+                notes: "OS内蔵の単語分散表現と文字N-gramを組み合わせた省メモリ256次元Embeddingモデル。"
             )
         ]
     }

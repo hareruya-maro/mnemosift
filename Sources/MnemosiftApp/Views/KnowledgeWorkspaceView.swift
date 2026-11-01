@@ -27,6 +27,10 @@ public struct KnowledgeWorkspaceView: View {
     @State private var newDocContent: String = "# 音声処理パイプライン仕様\nQwen3-ASRとSystem One判断モデルを非同期キューで接続する。"
     @State private var newDocStorageMode: DocumentStorageMode = .copiedToManagedStorage
 
+    // 選択中ドキュメントの編集・差分更新用
+    @State private var isEditingSelectedDoc: Bool = false
+    @State private var editingDocContent: String = ""
+
     // 新規用語追加用
     @State private var newTermCanonical: String = ""
     @State private var newTermReading: String = ""
@@ -89,8 +93,25 @@ public struct KnowledgeWorkspaceView: View {
                     }
                 }
                 .controlSize(.small)
-                .frame(width: 210)
+                .frame(width: 185)
                 .onChange(of: searchScope) {
+                    if !searchQuery.isEmpty { runHybridSearch() }
+                }
+
+                Picker(
+                    "方式",
+                    selection: Binding(
+                        get: { workspace.searchService.selectedHybridMode },
+                        set: { workspace.searchService.selectedHybridMode = $0 }
+                    )
+                ) {
+                    ForEach(HybridSearchExecutionMode.allCases) { hMode in
+                        Text(hMode.displayName).tag(hMode)
+                    }
+                }
+                .controlSize(.small)
+                .frame(width: 245)
+                .onChange(of: workspace.searchService.selectedHybridMode) {
                     if !searchQuery.isEmpty { runHybridSearch() }
                 }
 
@@ -101,6 +122,14 @@ public struct KnowledgeWorkspaceView: View {
                 .controlSize(.small)
 
                 Spacer()
+
+                Button("インデックス再生成", systemImage: "arrow.triangle.2.circlepath") {
+                    if let count = try? workspace.searchService.regenerateAllSearchIndexes() {
+                        workspace.statusBannerMessage = "✅ 2階層ハイブリッド検索インデックスを再生成しました（\(count)件）"
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
 
                 Button("＋ 資料を追加", systemImage: "doc.badge.plus") {
                     isShowingAddDocumentPopover = true
@@ -194,39 +223,106 @@ public struct KnowledgeWorkspaceView: View {
     }
 
     private var searchHitListSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("ハイブリッド検索結果 (\(workspace.searchService.lastSearchResults.count)件)")
-                .font(.caption.bold())
+        let docHits = workspace.searchService.lastDocumentSearchResults
+        let metrics = workspace.searchService.lastStorageAndSpeedMetrics
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("2階層ハイブリッド検索結果 (\(docHits.count)文書)")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(String(
+                    format: "検索: %.1fms (FTS %.1fms / Vec %.1fms / RRF %.1fms)",
+                    metrics.lastSearchTiming.totalSearchMs,
+                    metrics.lastSearchTiming.ftsSearchMs,
+                    metrics.lastSearchTiming.vectorSearchMs,
+                    metrics.lastSearchTiming.rrfFusionMs
+                ))
+                .font(.caption2)
                 .foregroundStyle(.secondary)
+            }
 
-            ForEach(workspace.searchService.lastSearchResults) { item in
-                Button {
-                    selectSearchResult(item)
-                } label: {
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text(item.chunk.sourceType.rawValue)
-                                .font(.caption2.bold())
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(.blue.opacity(0.15), in: Capsule())
-                            Text(item.chunk.title)
-                                .font(.subheadline.bold())
-                            Spacer()
-                            Text(String(format: "関連度 %.0f%%", min(99, item.breakdown.totalScore * 100)))
-                                .font(.caption2.bold())
-                                .foregroundStyle(.blue)
-                        }
-                        Text(item.chunk.content)
-                            .font(.caption)
+            if !docHits.isEmpty {
+                ForEach(docHits) { docHit in
+                    Button {
+                        workspace.jumpToDocumentSearchResult(docHit)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack {
+                                Text(docHit.documentType.displayName)
+                                    .font(.caption2.bold())
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(.blue.opacity(0.15), in: Capsule())
+                                Text(docHit.title)
+                                    .font(.subheadline.bold())
+                                Spacer()
+                                Text(String(format: "RRF: %.4f", docHit.rrfScore))
+                                    .font(.caption2.bold())
+                                    .foregroundStyle(.blue)
+                            }
+
+                            Text(docHit.snippet)
+                                .font(.caption)
+                                .foregroundStyle(.primary)
+                                .lineLimit(3)
+
+                            HStack(spacing: 8) {
+                                Text("📍 \(docHit.locationHintText)")
+                                if let fRank = docHit.ftsRank {
+                                    Text("FTS #\(fRank)")
+                                }
+                                if let vRank = docHit.vectorRank {
+                                    Text("Vec #\(vRank)")
+                                }
+                                if let cos = docHit.cosineSimilarity {
+                                    Text(String(format: "Cos %.2f", cos))
+                                }
+                                Spacer()
+                                if !docHit.matchedKeywords.isEmpty {
+                                    Text("KW: \(docHit.matchedKeywords.prefix(4).joined(separator: ", "))")
+                                        .lineLimit(1)
+                                }
+                            }
+                            .font(.caption2)
                             .foregroundStyle(.secondary)
-                            .lineLimit(2)
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
                     }
-                    .padding(10)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
+            } else {
+                ForEach(workspace.searchService.lastSearchResults) { item in
+                    Button {
+                        selectSearchResult(item)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text(item.chunk.sourceType.rawValue)
+                                    .font(.caption2.bold())
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(.blue.opacity(0.15), in: Capsule())
+                                Text(item.chunk.title)
+                                    .font(.subheadline.bold())
+                                Spacer()
+                                Text(String(format: "関連度 %.0f%%", min(99, item.breakdown.totalScore * 100)))
+                                    .font(.caption2.bold())
+                                    .foregroundStyle(.blue)
+                            }
+                            Text(item.chunk.content)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+                }
             }
         }
     }
@@ -449,15 +545,55 @@ public struct KnowledgeWorkspaceView: View {
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                     }
+
+                    if isEditingSelectedDoc {
+                        Button("保存して差分インデックス更新", systemImage: "checkmark.circle.fill") {
+                            if let outcome = try? workspace.documentService.updateDocumentContent(
+                                documentId: doc.id,
+                                newContent: editingDocContent
+                            ) {
+                                workspace.statusBannerMessage = "✅ 差分インデックス更新完了（チャンク\(outcome.chunkCount)件 / 再利用\(outcome.reusedVectorCount)件 / 新規生成\(outcome.generatedVectorCount)件）"
+                            }
+                            isEditingSelectedDoc = false
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    } else {
+                        Button("編集", systemImage: "pencil") {
+                            editingDocContent = doc.extractedText
+                            isEditingSelectedDoc = true
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+
+                    Button("削除", systemImage: "trash", role: .destructive) {
+                        try? workspace.documentService.deleteDocument(documentId: doc.id)
+                        workspace.selectedDocumentId = workspace.documentService.documents.first?.id
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+
+                if let range = workspace.highlightedCharacterRange {
+                    Text("📍 検索ヒット位置: 文字オフセット \(range.start)〜\(range.end)")
+                        .font(.caption2.bold())
+                        .foregroundStyle(.blue)
                 }
 
                 Divider()
 
-                ScrollView {
-                    Text(doc.extractedText)
+                if isEditingSelectedDoc {
+                    TextEditor(text: $editingDocContent)
                         .font(.system(.callout, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollView {
+                        Text(doc.extractedText)
+                            .font(.system(.callout, design: .monospaced))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
                 }
             }
             .padding(16)

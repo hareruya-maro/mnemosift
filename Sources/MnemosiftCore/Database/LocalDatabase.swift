@@ -92,11 +92,126 @@ public final class LocalDatabase: @unchecked Sendable {
                 content,
                 tokenize = 'unicode61'
             );
+            """,
+            // --- ローカルAIドキュメント検索機能 実装仕様書 v1.0 (§4.1〜§4.6) ---
             """
+            CREATE TABLE IF NOT EXISTS documents (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                type TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                source_uri TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                occurred_at REAL,
+                content_hash TEXT NOT NULL,
+                content_version INTEGER NOT NULL DEFAULT 1,
+                indexing_version INTEGER NOT NULL DEFAULT 1,
+                index_status TEXT NOT NULL DEFAULT 'pending',
+                indexed_at REAL,
+                project_ids_json TEXT NOT NULL DEFAULT '[]',
+                participants_json TEXT NOT NULL DEFAULT '[]',
+                error_message TEXT
+            );
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(index_status, updated_at DESC);",
+            "CREATE INDEX IF NOT EXISTS idx_documents_type_occurred ON documents(type, occurred_at DESC);",
+            """
+            CREATE TABLE IF NOT EXISTS document_contents (
+                document_id TEXT PRIMARY KEY,
+                raw_text TEXT NOT NULL,
+                is_external_cache_only INTEGER NOT NULL DEFAULT 0,
+                is_source_accessible INTEGER NOT NULL DEFAULT 1,
+                updated_at REAL NOT NULL
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS document_chunks (
+                id TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                start_offset INTEGER NOT NULL,
+                end_offset INTEGER NOT NULL,
+                start_time_ms INTEGER,
+                end_time_ms INTEGER,
+                content_hash TEXT NOT NULL
+            );
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_document_chunks_doc ON document_chunks(document_id, chunk_index ASC);",
+            """
+            CREATE TABLE IF NOT EXISTS search_units (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id TEXT NOT NULL,
+                chunk_id TEXT,
+                unit_type TEXT NOT NULL,
+                title_terms TEXT NOT NULL,
+                keywords TEXT NOT NULL,
+                body_terms TEXT NOT NULL
+            );
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_search_units_doc ON search_units(document_id, unit_type);",
+            "CREATE INDEX IF NOT EXISTS idx_search_units_chunk ON search_units(chunk_id);",
+            // §4.5 External Content FTS5 テーブル（本文の重複保存を避け、search_units の id を rowid として参照）
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS search_units_fts USING fts5(
+                title_terms,
+                keywords,
+                body_terms,
+                content = 'search_units',
+                content_rowid = 'id',
+                tokenize = 'unicode61'
+            );
+            """,
+            // §4.5 External Content FTS5 自動同期トリガー（INSERT / DELETE / UPDATE 時の不整合防止）
+            """
+            CREATE TRIGGER IF NOT EXISTS search_units_ai AFTER INSERT ON search_units BEGIN
+                INSERT INTO search_units_fts(rowid, title_terms, keywords, body_terms)
+                VALUES (new.id, new.title_terms, new.keywords, new.body_terms);
+            END;
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS search_units_ad AFTER DELETE ON search_units BEGIN
+                INSERT INTO search_units_fts(search_units_fts, rowid, title_terms, keywords, body_terms)
+                VALUES ('delete', old.id, old.title_terms, old.keywords, old.body_terms);
+            END;
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS search_units_au AFTER UPDATE ON search_units BEGIN
+                INSERT INTO search_units_fts(search_units_fts, rowid, title_terms, keywords, body_terms)
+                VALUES ('delete', old.id, old.title_terms, old.keywords, old.body_terms);
+                INSERT INTO search_units_fts(rowid, title_terms, keywords, body_terms)
+                VALUES (new.id, new.title_terms, new.keywords, new.body_terms);
+            END;
+            """,
+            // §4.6 embeddings テーブル（search_unit_id 1件につき Float32 ベクター BLOB とモデルメタデータを保持）
+            """
+            CREATE TABLE IF NOT EXISTS embeddings (
+                search_unit_id INTEGER PRIMARY KEY,
+                embedding_model_id TEXT NOT NULL,
+                embedding_dimension INTEGER NOT NULL,
+                embedding_version INTEGER NOT NULL DEFAULT 1,
+                generated_at REAL NOT NULL,
+                vector_blob BLOB NOT NULL
+            );
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(embedding_model_id, embedding_version);"
         ]
         for sql in statements {
             try executeRaw(sql)
         }
+    }
+
+    public func withSQLiteHandle<R>(_ body: (OpaquePointer) throws -> R) throws -> R {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let db else { throw DatabaseError.openFailed("Database closed") }
+        return try body(db)
+    }
+
+    public func executeRawSQL(_ sql: String) throws {
+        try executeRaw(sql)
     }
 
     private func executeRaw(_ sql: String) throws {

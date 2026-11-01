@@ -345,6 +345,54 @@ public final class DocumentService {
         try embeddingService.indexDocument(doc, projectIds: history.previousProjectIds)
     }
 
+    // MARK: - §2.1 & §11.2, §11.3 アプリ内登録ドキュメントの更新・削除と差分インデックス管理
+
+    /// アプリ内で登録したドキュメントの内容・タイトルを更新し、チャンクハッシュ比較による差分インデックス更新を行う（§11.2）
+    @discardableResult
+    public func updateDocumentContent(
+        documentId: UUID,
+        newFileName: String? = nil,
+        newContent: String
+    ) throws -> DocumentIndexingOutcome {
+        guard let idx = documents.firstIndex(where: { $0.id == documentId }) else {
+            throw NSError(domain: "DocumentService", code: 404, userInfo: [NSLocalizedDescriptionKey: "対象のドキュメントが見つかりません"])
+        }
+        var doc = documents[idx]
+        if let newFileName, !newFileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            doc.fileName = newFileName
+        }
+        doc.extractedText = newContent
+        doc.contentHash = Self.sha256Hex(of: newContent)
+        doc.fileSizeBytes = Int64(newContent.utf8.count)
+        doc.summary = Self.buildLightweightSummary(from: newContent)
+        doc.updatedAt = Date()
+
+        // 管理領域コピー方式でローカルファイルが存在する場合はファイル内容も更新
+        if doc.storageMode == .copiedToManagedStorage, !doc.filePath.isEmpty {
+            try? newContent.write(toFile: doc.filePath, atomically: true, encoding: .utf8)
+        }
+
+        documents[idx] = doc
+        try database.saveDocument(doc)
+
+        let pids = projectService.projectIds(forDocument: doc.id)
+        return try embeddingService.indexDocument(doc, projectIds: pids)
+    }
+
+    /// アプリ内で登録したドキュメントを削除し、documents / document_contents / document_chunks / search_units / FTS5 / embeddings から完全削除する（§11.3）
+    public func deleteDocument(documentId: UUID) throws {
+        if let idx = documents.firstIndex(where: { $0.id == documentId }) {
+            let doc = documents[idx]
+            if doc.storageMode == .copiedToManagedStorage, FileManager.default.fileExists(atPath: doc.filePath) {
+                try? FileManager.default.removeItem(atPath: doc.filePath)
+            }
+            documents.remove(at: idx)
+        }
+        operationHistories.removeAll { $0.documentId == documentId }
+        try database.deleteDocument(id: documentId)
+        try embeddingService.deleteDocumentIndex(documentId: documentId)
+    }
+
     // MARK: - Folder Monitoring (仕様書 §7.5 自動分類・フォルダ監視)
 
     public func startMonitoringFolder(path: String, projectId: UUID? = nil) {
@@ -393,7 +441,7 @@ public final class DocumentService {
                     documents[existingIdx].updatedAt = Date()
                     try? database.saveDocument(documents[existingIdx])
                     let pids = projectService.projectIds(forDocument: documents[existingIdx].id)
-                    try? embeddingService.indexDocument(documents[existingIdx], projectIds: pids)
+                    _ = try? embeddingService.indexDocument(documents[existingIdx], projectIds: pids)
                 }
             } else {
                 let pids = projectId.map { [$0] } ?? []

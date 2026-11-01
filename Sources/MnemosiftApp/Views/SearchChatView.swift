@@ -83,8 +83,44 @@ public struct SearchChatView: View {
                             Text(kind.rawValue).tag(KnowledgeSourceType?.some(kind))
                         }
                     }
+
+                    Picker(
+                        "検索エンジン",
+                        selection: Binding(
+                            get: { workspace.searchService.selectedHybridMode },
+                            set: { workspace.searchService.selectedHybridMode = $0 }
+                        )
+                    ) {
+                        ForEach(HybridSearchExecutionMode.allCases) { hMode in
+                            Text(hMode.displayName).tag(hMode)
+                        }
+                    }
+                    .onChange(of: workspace.searchService.selectedHybridMode) {
+                        executeSearch()
+                    }
                 }
                 .font(.caption)
+
+                let metrics = workspace.searchService.lastStorageAndSpeedMetrics
+                HStack(spacing: 10) {
+                    Text("文書:\(metrics.readyDocumentCount) チャンク:\(metrics.chunkCount) Vec:\(metrics.vectorCount) (\(metrics.activeEmbeddingDimension)d)")
+                    Text(String(format: "検索:%.1fms", metrics.lastSearchTiming.totalSearchMs))
+                    Spacer()
+                    Button("52件品質評価", systemImage: "chart.bar.doc.horizontal") {
+                        if let rep = try? workspace.searchService.runQualityEvaluationSuite() {
+                            workspace.statusBannerMessage = String(
+                                format: "📊 52クエリ評価完了 — Hybrid Recall@5: %.0f%% (MRR %.2f) / FTS Recall@5: %.0f%% / Vec Recall@5: %.0f%%",
+                                rep.hybridMetrics.recallAt5 * 100,
+                                rep.hybridMetrics.mrr,
+                                rep.ftsOnlyMetrics.recallAt5 * 100,
+                                rep.vectorOnlyMetrics.recallAt5 * 100
+                            )
+                        }
+                    }
+                    .controlSize(.mini)
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
             }
             .padding(14)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
