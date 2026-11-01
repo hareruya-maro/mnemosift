@@ -96,6 +96,20 @@ public struct ProcessingJob: Codable, Sendable, Identifiable, Equatable, Hashabl
     }
 }
 
+public enum WorkspaceMode: String, Codable, CaseIterable, Sendable, Identifiable {
+    case meetingPartner = "会議パートナー"
+    case knowledgeHub = "資料検索・整理"
+
+    public var id: String { rawValue }
+
+    public var systemImage: String {
+        switch self {
+        case .meetingPartner: "waveform.and.person.filled"
+        case .knowledgeHub: "books.vertical.fill"
+        }
+    }
+}
+
 public enum NavigationSection: String, Codable, CaseIterable, Sendable, Identifiable {
     case home = "ホーム"
     case recording = "録音・文字起こし"

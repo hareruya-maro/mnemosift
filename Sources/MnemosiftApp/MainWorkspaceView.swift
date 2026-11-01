@@ -1,8 +1,14 @@
 import SwiftUI
 import MnemosiftCore
 
+/// サイドバーを廃止した1ウィンドウ・2モード切替メイン画面
+/// - 上部統合バーで「🎙️ 会議パートナー」と「📚 資料検索・整理」をワンクリック切替
+/// - プロジェクト文脈スイッチャーと設定・外部連携シートボタンを上部に配置
 public struct MainWorkspaceView: View {
     @Bindable var workspace: AppWorkspaceController
+    @State private var isShowingNewProjectPopover: Bool = false
+    @State private var newProjectName: String = ""
+    @State private var newProjectDesc: String = ""
 
     public init(workspace: AppWorkspaceController) {
         self.workspace = workspace
@@ -10,8 +16,12 @@ public struct MainWorkspaceView: View {
 
     public var body: some View {
         VStack(spacing: 0) {
-            // 仕様書 §5.2: 録音状態の常時表示バー（他画面に移動しても常時表示・操作可能）
-            if workspace.recordingService.state == .recording || workspace.recordingService.state == .paused {
+            topUnifiedHeaderBar
+            Divider()
+
+            // 資料検索モード閲覧中に録音が行われている場合は、上部にコンパクトな録音ステータスバーを常時表示
+            if workspace.activeMode == .knowledgeHub &&
+               (workspace.recordingService.state == .recording || workspace.recordingService.state == .paused) {
                 RecordingStatusBar(workspace: workspace)
             }
 
@@ -29,118 +39,126 @@ public struct MainWorkspaceView: View {
                     .buttonStyle(.plain)
                 }
                 .padding(.horizontal, 16)
-                .padding(.vertical, 8)
+                .padding(.vertical, 6)
                 .background(.blue.opacity(0.1))
             }
 
-            NavigationSplitView {
-                List(NavigationSection.allCases, selection: $workspace.selectedSection) { section in
-                    NavigationLink(value: section) {
-                        HStack {
-                            Label(section.rawValue, systemImage: section.systemImage)
-                            Spacer()
-                            badgeForSection(section)
-                        }
-                    }
-                }
-                .navigationTitle("Mnemosift")
-                .safeAreaInset(edge: .bottom) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Divider()
-                        HStack(spacing: 6) {
-                            Circle()
-                                .fill(.green)
-                                .frame(width: 8, height: 8)
-                            Text("ローカルファースト・オフライン稼働")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                        Text("プロジェクト選択: \(activeProjectName)")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    .padding(12)
-                }
-            } detail: {
-                switch workspace.selectedSection {
-                case .home:
-                    HomeView(workspace: workspace)
-                case .recording:
-                    RecordingTranscriptionView(workspace: workspace)
-                case .meetings:
-                    MeetingsView(workspace: workspace)
-                case .files:
-                    FilesView(workspace: workspace)
-                case .searchChat:
-                    SearchChatView(workspace: workspace)
-                case .projects:
-                    ProjectsView(workspace: workspace)
-                case .history:
-                    ProcessingHistoryView(workspace: workspace)
-                case .settings:
-                    SettingsView(workspace: workspace)
-                }
+            switch workspace.activeMode {
+            case .meetingPartner:
+                MeetingPartnerView(workspace: workspace)
+            case .knowledgeHub:
+                KnowledgeWorkspaceView(workspace: workspace)
             }
+        }
+        .sheet(isPresented: $workspace.isShowingSettingsSheet) {
+            SettingsAndToolsSheet(workspace: workspace)
         }
     }
 
-    private var activeProjectName: String {
-        if let pid = workspace.selectedProjectId,
-           let proj = workspace.projectService.project(for: pid) {
-            return proj.name
-        }
-        return "未指定（単発モード）"
-    }
+    private var topUnifiedHeaderBar: some View {
+        HStack(spacing: 16) {
+            // 左側: アプリ名 ＋ プロジェクト文脈切替フィルタ
+            HStack(spacing: 10) {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(.green)
+                        .frame(width: 8, height: 8)
+                    Text("Mnemosift")
+                        .font(.headline.bold())
+                }
 
-    @ViewBuilder
-    private func badgeForSection(_ section: NavigationSection) -> some View {
-        switch section {
-        case .recording:
-            if workspace.recordingService.state == .recording {
-                Text("REC")
-                    .font(.caption2.bold())
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(.red, in: Capsule())
-                    .foregroundStyle(.white)
+                Divider()
+                    .frame(height: 18)
+
+                Picker("プロジェクト", selection: $workspace.selectedProjectId) {
+                    Text("すべてのプロジェクト（単発）").tag(UUID?.none)
+                    ForEach(workspace.projectService.projects) { project in
+                        Text("📁 \(project.name)").tag(UUID?.some(project.id))
+                    }
+                }
+                .labelsHidden()
+                .controlSize(.small)
+                .frame(width: 220)
+                .onChange(of: workspace.selectedProjectId) {
+                    workspace.refreshMeetingPartnerState()
+                }
+
+                Button("新規プロジェクト", systemImage: "plus.rectangle.on.folder") {
+                    isShowingNewProjectPopover = true
+                }
+                .labelStyle(.iconOnly)
+                .controlSize(.small)
+                .help("新しいプロジェクトを作成")
+                .popover(isPresented: $isShowingNewProjectPopover) {
+                    newProjectPopoverContent
+                }
             }
-        case .meetings:
-            Text("\(workspace.llmService.meetings.count)")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-        case .files:
-            let pendingCount = workspace.documentService.operationHistories.filter { $0.status == .pendingApproval }.count
-            if pendingCount > 0 {
-                Text("提案\(pendingCount)")
-                    .font(.caption2.bold())
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(.orange.opacity(0.2), in: Capsule())
-                    .foregroundStyle(.orange)
+
+            Spacer()
+
+            // 中央: メインの2モード切替タブ（🎙️ 会議パートナー ⇄ 📚 資料検索・整理）
+            Picker("ワークスペースモード", selection: $workspace.activeMode) {
+                Label("🎙️ 会議パートナー", systemImage: "waveform.and.person.filled")
+                    .tag(WorkspaceMode.meetingPartner)
+                Label("📚 資料検索・整理", systemImage: "books.vertical.fill")
+                    .tag(WorkspaceMode.knowledgeHub)
             }
-        case .projects:
-            let candidateCount = workspace.projectService.vocabularies.filter { $0.approvalStatus == .candidate }.count
-            if candidateCount > 0 {
-                Text("候補\(candidateCount)")
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 340)
+
+            Spacer()
+
+            // 右側: 現在のAI構成バッジ ＆ 設定・外部LLM連携ボタン
+            HStack(spacing: 10) {
+                let activeProject = workspace.projectService.project(for: workspace.selectedProjectId)
+                let resolved = workspace.modelManager.resolveConfiguration(project: activeProject)
+
+                Text("\(resolved.realtimeSTTModel.name) + \(resolved.llmModel.name)")
                     .font(.caption2)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(.blue.opacity(0.15), in: Capsule())
-                    .foregroundStyle(.blue)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(.secondary.opacity(0.1), in: Capsule())
+
+                Button("設定・連携", systemImage: "slider.horizontal.3") {
+                    workspace.isShowingSettingsSheet = true
+                }
+                .controlSize(.small)
+                .buttonStyle(.bordered)
             }
-        case .history:
-            let activeCount = workspace.jobManager.activeRunningJobsCount
-            if activeCount > 0 {
-                Text("\(activeCount)")
-                    .font(.caption2.bold())
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(.green.opacity(0.2), in: Capsule())
-                    .foregroundStyle(.green)
-            }
-        default:
-            EmptyView()
         }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 10)
+        .background(.bar)
+    }
+
+    private var newProjectPopoverContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("新規プロジェクト作成")
+                .font(.headline)
+            TextField("プロジェクト名", text: $newProjectName)
+                .textFieldStyle(.roundedBorder)
+            TextField("説明・テーマ", text: $newProjectDesc)
+                .textFieldStyle(.roundedBorder)
+            HStack {
+                Spacer()
+                Button("作成") {
+                    guard !newProjectName.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+                    if let proj = try? workspace.projectService.createProject(
+                        name: newProjectName,
+                        description: newProjectDesc
+                    ) {
+                        workspace.selectedProjectId = proj.id
+                        newProjectName = ""
+                        newProjectDesc = ""
+                        isShowingNewProjectPopover = false
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(14)
+        .frame(width: 300)
     }
 }

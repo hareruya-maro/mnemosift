@@ -55,8 +55,8 @@ public struct RecordingStatusBar: View {
             .tint(.red)
             .controlSize(.small)
 
-            Button("録音画面を開く", systemImage: "arrow.up.right.square") {
-                workspace.selectedSection = .recording
+            Button("会議パートナーへ戻る", systemImage: "arrow.up.right.square") {
+                workspace.activeMode = .meetingPartner
             }
             .controlSize(.small)
         }

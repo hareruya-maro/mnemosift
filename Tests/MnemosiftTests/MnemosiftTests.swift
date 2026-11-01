@@ -411,4 +411,93 @@ struct MnemosiftTests {
         #expect(benchResults.count == 4)
         #expect(benchResults.allSatisfy { $0.passedGuardrails })
     }
+
+    @Test("8. 会議パートナーのライブ議論要約・関連資料の自動提案・CLI/MCP外部LLM連携ブリッジの検証")
+    func testMeetingPartnerCopilotAndExternalToolBridge() async throws {
+        let ws = try makeIsolatedController()
+        let project = try #require(ws.projectService.projects.first)
+
+        // 1. 関連資料を登録
+        let tempDir = FileManager.default.temporaryDirectory
+        let specURL = tempDir.appendingPathComponent("audio_architecture.md")
+        let specText = "# システム音声録音設計書\nScreenCaptureKit と Qwen3-ASR を組み合わせてリアルタイム文字起こしを実現する。"
+        try specText.write(to: specURL, atomically: true, encoding: .utf8)
+
+        let doc = try await ws.documentService.registerFile(
+            url: specURL,
+            storageMode: .copiedToManagedStorage,
+            explicitContent: specText,
+            initialProjectIds: [project.id]
+        )
+
+        // 2. 会議を開始して発話を追加
+        let rec = try ws.recordingService.startRecording(
+            title: "AIパートナー検証会議",
+            source: .microphoneAndSystem,
+            projectIds: [project.id]
+        )
+        let tr = try ws.sttService.createTranscriptSession(
+            for: rec,
+            sttModelId: "stt-qwen3-asr-0.6b",
+            correctionMode: .fastAI
+        )
+        ws.activeTranscriptId = tr.id
+        let config = ws.modelManager.resolveConfiguration(project: project)
+        let vocabs = ws.projectService.activeVocabularies(forProjectIds: [project.id])
+
+        _ = try await ws.sttService.processRealtimeUtteranceChunk(
+            transcriptId: tr.id,
+            rawUtteranceText: "本日の議題として、スクリーンキャプチャーキットとキュウエン・エーエスアールの連携仕様を確認します。",
+            speakerLabel: "佐藤",
+            startTimeSeconds: 0,
+            endTimeSeconds: 5,
+            sttModel: config.realtimeSTTModel,
+            correctionMode: .fastAI,
+            vocabularies: vocabs,
+            judgeModel: config.judgeModel,
+            llmModel: config.llmModel
+        )
+        _ = try await ws.sttService.processRealtimeUtteranceChunk(
+            transcriptId: tr.id,
+            rawUtteranceText: "決定事項として、来週月曜日までに鈴木さんが録音テストを実施することとします。",
+            speakerLabel: "佐藤",
+            startTimeSeconds: 5,
+            endTimeSeconds: 10,
+            sttModel: config.realtimeSTTModel,
+            correctionMode: .fastAI,
+            vocabularies: vocabs,
+            judgeModel: config.judgeModel,
+            llmModel: config.llmModel
+        )
+
+        // 3. 会議パートナーの状態を更新し、ライブ要約と関連資料が自動提案されていることを確認
+        ws.refreshMeetingPartnerState()
+        let digest = ws.meetingPartnerService.liveDigest
+        #expect(digest.utteranceCount == 2)
+        #expect(!digest.decisions.isEmpty)
+
+        let suggestions = ws.meetingPartnerService.relatedSuggestions
+        #expect(!suggestions.isEmpty)
+        #expect(suggestions.contains(where: { $0.kind == .document && $0.sourceId == doc.id }))
+
+        // 4. CLI & MCP ブリッジの動作確認
+        let bridge = ExternalToolBridge(workspace: ws)
+        let cliSearchOut = bridge.runSearchCommand(query: "ScreenCaptureKit Qwen3-ASR", asJSON: false)
+        #expect(cliSearchOut.contains("audio_architecture.md"))
+
+        let mcpInitReply = try #require(bridge.handleMCPJSONRPCRequest(
+            jsonLine: #"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#
+        ))
+        #expect(mcpInitReply.contains("mnemosift-local-workspace"))
+
+        let mcpToolsReply = try #require(bridge.handleMCPJSONRPCRequest(
+            jsonLine: #"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#
+        ))
+        #expect(mcpToolsReply.contains("mnemosift_search"))
+
+        let mcpCallReply = try #require(bridge.handleMCPJSONRPCRequest(
+            jsonLine: #"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"mnemosift_search","arguments":{"query":"ScreenCaptureKit"}}}"#
+        ))
+        #expect(mcpCallReply.contains("audio_architecture.md"))
+    }
 }

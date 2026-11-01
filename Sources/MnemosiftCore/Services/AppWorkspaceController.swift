@@ -16,7 +16,13 @@ public final class AppWorkspaceController {
     public let llmService: LLMService
     public let documentService: DocumentService
     public let searchService: SearchService
+    public let meetingPartnerService: MeetingPartnerService
     public let benchmarkRunner: BenchmarkRunner
+
+    // 1ウィンドウ・タブ切替モード（会議パートナー ⇄ 資料検索・整理）
+    public var activeMode: WorkspaceMode = .meetingPartner
+    public var isShowingPastSessionsDrawer: Bool = false
+    public var isShowingSettingsSheet: Bool = false
 
     // ナビゲーション状態（録音中も自由に画面遷移可能）
     public var selectedSection: NavigationSection = .home
@@ -83,6 +89,14 @@ public final class AppWorkspaceController {
         )
         self.searchService = searchSvc
 
+        let partnerSvc = MeetingPartnerService(
+            searchService: searchSvc,
+            documentService: docSvc,
+            llmService: llmSvc,
+            projectService: projSvc
+        )
+        self.meetingPartnerService = partnerSvc
+
         let bench = BenchmarkRunner(
             database: db,
             modelManager: modelMgr,
@@ -101,13 +115,27 @@ public final class AppWorkspaceController {
             self.activeTranscriptId = sttSvc.transcripts.first?.id
             self.selectedMeetingId = llmSvc.meetings.first?.id
             self.selectedDocumentId = docSvc.documents.first?.id
+            self.refreshMeetingPartnerState()
         }
+    }
+
+    public func refreshMeetingPartnerState() {
+        let tr = activeTranscriptId.flatMap { id in sttService.transcripts.first { $0.id == id } }
+            ?? sttService.transcripts.first
+        let segs = tr.map { sttService.segments(for: $0.id) } ?? []
+        meetingPartnerService.refreshCopilotContext(
+            transcript: tr,
+            segments: segs,
+            activeProjectId: selectedProjectId
+        )
     }
 
     /// 仕様書 §9.6: プロジェクト詳細画面から操作を開始した際に対象プロジェクトを初期選択して画面遷移する
     public func navigateFromProject(_ projectId: UUID, to section: NavigationSection) {
         self.selectedProjectId = projectId
         self.selectedSection = section
+        self.activeMode = section == .recording || section == .meetings ? .meetingPartner : .knowledgeHub
+        self.refreshMeetingPartnerState()
     }
 
     /// 仕様書 §8.4 & §6.4: AIチャットの参照元や議事録から該当ファイル・議事録・文字起こし箇所へ直接移動する
@@ -116,12 +144,16 @@ public final class AppWorkspaceController {
         case .document:
             selectedDocumentId = citation.sourceId
             selectedSection = .files
+            activeMode = .knowledgeHub
         case .meetingMinutes:
             selectedMeetingId = citation.sourceId
             selectedSection = .meetings
+            activeMode = .knowledgeHub
         case .transcriptSegment:
             activeTranscriptId = citation.sourceId
             selectedSection = .recording
+            activeMode = .meetingPartner
+            refreshMeetingPartnerState()
         }
         statusBannerMessage = "参照元『\(citation.title)』(\(citation.locationHint)) を表示しています"
     }
@@ -215,5 +247,6 @@ public final class AppWorkspaceController {
 
         self.activeTranscriptId = transcript.id
         self.selectedMeetingId = meeting.id
+        self.refreshMeetingPartnerState()
     }
 }
