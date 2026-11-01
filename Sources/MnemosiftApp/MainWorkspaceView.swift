@@ -25,6 +25,25 @@ public struct MainWorkspaceView: View {
                 RecordingStatusBar(workspace: workspace)
             }
 
+            // アップデートが利用可能な場合の通知バナー
+            if case let .updateAvailable(release) = AppUpdateService.shared.status {
+                HStack(spacing: 8) {
+                    Image(systemName: "sparkles")
+                        .foregroundStyle(.purple)
+                    Text("新しいバージョン \(release.tagName) が利用可能です")
+                        .font(.callout.bold())
+                    Spacer()
+                    Button("アップデート詳細", systemImage: "arrow.down.circle") {
+                        AppUpdateService.shared.isShowingUpdateSheet = true
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(Color.purple.opacity(0.12))
+            }
+
             if let banner = workspace.statusBannerMessage {
                 HStack {
                     Image(systemName: "info.circle.fill")

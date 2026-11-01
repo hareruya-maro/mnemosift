@@ -6,6 +6,7 @@ import MnemosiftCore
 @main
 struct MnemosiftApp: App {
     @State private var workspace: AppWorkspaceController
+    @State private var updateService = AppUpdateService.shared
 
     init() {
         let args = ProcessInfo.processInfo.arguments
@@ -72,8 +73,27 @@ struct MnemosiftApp: App {
         WindowGroup("Mnemosift — 会議のAIパートナー & ローカルナレッジ") {
             MainWorkspaceView(workspace: workspace)
                 .frame(minWidth: 1120, minHeight: 740)
+                .sheet(isPresented: $updateService.isShowingUpdateSheet) {
+                    UpdateSheetView()
+                }
+                .task {
+                    // 起動時に自動アップデート確認（設定が有効な場合、3秒後に非同期確認）
+                    if updateService.automaticallyCheckForUpdates {
+                        try? await Task.sleep(nanoseconds: 3_000_000_000)
+                        await updateService.checkForUpdates(isUserInitiated: false)
+                    }
+                }
         }
         .windowResizability(.contentMinSize)
+        .commands {
+            CommandGroup(after: .appInfo) {
+                Button("アップデートを確認...") {
+                    Task {
+                        await updateService.checkForUpdates(isUserInitiated: true)
+                    }
+                }
+            }
+        }
 
         // §8.3 メニューバー常駐コントロール（同期状態表示・手動同期・一時停止・環境設定）
         MenuBarExtra("Mnemosift Google Drive", systemImage: menuBarIconName) {

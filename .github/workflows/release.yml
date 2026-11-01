@@ -1,0 +1,58 @@
+name: Release Mnemosift
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 0.1.0, without v prefix)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Release macOS App
+    runs-on: macos-14
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine Version
+        id: get_version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "Sources/MnemosiftApp/Info.plist" 2>/dev/null || echo "0.1.0")
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building Mnemosift version: $VERSION"
+
+      - name: Build & Package App (.app, .zip, .dmg)
+        run: |
+          ./scripts/package_release.sh --version "${{ steps.get_version.outputs.VERSION }}"
+
+      - name: Create GitHub Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Mnemosift v${{ steps.get_version.outputs.VERSION }}"
+          tag_name: ${{ github.ref_name || format('v{0}', steps.get_version.outputs.VERSION) }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          files: |
+            dist/Mnemosift-v${{ steps.get_version.outputs.VERSION }}-macOS-arm64.zip
+            dist/Mnemosift-macOS-arm64.zip
+            dist/Mnemosift-v${{ steps.get_version.outputs.VERSION }}.dmg
+            dist/SHA256SUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

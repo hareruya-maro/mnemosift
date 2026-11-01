@@ -21,33 +21,54 @@ Mnemosift は、会議中にリアルタイム文字起こしと議論の要約�
 
 ---
 
-## 起動・CLI / MCP 連携・テスト方法
+## 🚀 インストール & 自動アップデート
 
-### 1. Mac デスクトップアプリ (GUI) の起動
+### 1. GitHub Releases からダウンロード
+[GitHub Releases](https://github.com/hareruya-maro/mnemosift/releases) から最新のリリースアセット（`.dmg` または `.zip`）をダウンロードしてください：
+- **`Mnemosift-vX.Y.Z.dmg`**: ダブルクリックして開いたウィンドウから `Mnemosift.app` を `/Applications` へドラッグ＆ドロップ。
+- **`Mnemosift-macOS-arm64.zip`**: 解凍して `/Applications` へ配置。
+
+> [!NOTE]
+> 初回起動時に「開発元を検証できないため開けません」と表示された場合は、Finder で `Mnemosift.app` を右クリック（Controlクリック）して「開く」を選択してください。
+
+### 2. アプリ内自動更新
+- **起動時自動チェック**: アプリ起動時に最新の GitHub Release をバックグラウンドで自動確認します（「⚙️ 設定 > 🚀 アプリ更新」から ON/OFF 切り替え可能）。
+- **手動確認**: メニューバーの「Mnemosift > アップデートを確認...」または設定シートの「🚀 アプリ更新」タブからいつでも最新リリースを確認可能。
+- **ワンクリック更新**: 新バージョンが利用可能な場合、リリースノートの確認と「今すぐアップデートして再起動」ボタンをクリックするだけで、最新版のダウンロード・置換・再起動が自動で行われます。
+
+---
+
+## 🛠️ 開発・ビルド・リリースワークフロー
+
+### 1. ローカルでの開発起動・CLI / MCP 連携・テスト
 ```bash
+# GUI デスクトップアプリの起動
 swift run Mnemosift
-```
 
-### 2. CLI コマンドとして検索・議事録取得（Claude Code / Codex / Raycast 等から利用）
-```bash
-# ローカル資料・議事録・発言をハイブリッド検索
+# CLI 検索・議事録取得
 swift run Mnemosift search "Qwen3-ASR 決定事項"
-swift run Mnemosift search "システム音声" --json
-
-# 議事録・決定事項・TODO一覧の取得
 swift run Mnemosift meetings --json
 
-# 登録資料一覧の取得
-swift run Mnemosift documents --json
-```
-
-### 3. MCP (Model Context Protocol) サーバーとして起動（Claude Desktop / Cursor 等から利用）
-```bash
+# MCP サーバー起動
 swift run Mnemosift mcp
-```
-提供ツール: `mnemosift_search`, `mnemosift_list_meetings`, `mnemosift_list_documents`, `mnemosift_lookup_vocabulary`
 
-### 4. 総合テストスイートの実行
-```bash
+# テストスイート実行
 swift test
 ```
+
+### 2. ローカルでのリリースパッケージング
+```bash
+# .build/Mnemosift.app のビルド
+./scripts/build_app.sh --configuration release
+
+# dist/ 配下に .zip, .dmg, SHA256SUMS.txt を生成
+./scripts/package_release.sh --version 0.1.0
+```
+
+### 3. GitHub Actions による自動リリース
+バージョンタグを push すると、GitHub Actions (`.github/workflows/release.yml`) が自動的に macOS ランナー上でビルド＆パッケージングを行い、GitHub Release を公開します：
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+また、GitHub リポジトリの **Actions > Release Mnemosift > Run workflow** から手動でトリガーすることも可能です。

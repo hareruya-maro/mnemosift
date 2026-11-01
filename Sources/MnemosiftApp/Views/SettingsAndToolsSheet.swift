@@ -14,6 +14,7 @@ public struct SettingsAndToolsSheet: View {
         case googleDrive = "☁️ Google Drive連携"
         case externalTools = "🔌 外部LLM連携 (MCP / CLI)"
         case diagnostics = "⚡ 処理履歴・技術検証"
+        case updates = "🚀 アプリ更新"
         public var id: String { rawValue }
     }
 
@@ -36,7 +37,7 @@ public struct SettingsAndToolsSheet: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .frame(width: 660)
+                .frame(width: 760)
                 Spacer()
                 Button("閉じる", systemImage: "xmark.circle.fill") {
                     workspace.isShowingSettingsSheet = false
@@ -58,6 +59,8 @@ public struct SettingsAndToolsSheet: View {
                 externalToolBridgeTabView
             case .diagnostics:
                 ProcessingHistoryView(workspace: workspace)
+            case .updates:
+                UpdateSheetView()
             }
         }
         .frame(minWidth: 920, minHeight: 620)

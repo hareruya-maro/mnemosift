@@ -98,4 +98,19 @@
   - ローカルLLMによる検索結果上位候補の再ランキング（Reranking）
   - 検索履歴に基づくランキング改善・同義語/略語辞書連携
 
+---
+
+## 6. 配布・アップデート基盤
+
+### - [x] GitHub Releases 配布・DMG/ZIP パッケージング・アプリ内自動更新エンジン
+- **優先度**: 高
+- **概要**:
+  - GitHub リモートリポジトリ（`https://github.com/hareruya-maro/mnemosift.git`）の設定
+  - `./scripts/build_app.sh` および `./scripts/package_release.sh` による `.app`, `.dmg`, `.zip`, `SHA256SUMS.txt` 生成
+  - GitHub Actions ワークフロー（`.github/workflows/release.yml`, `.github/workflows/ci.yml`）によるタグリリースの自動ビルド・公開
+  - `UpdateTypes.swift`（SemVer パース・比較、GitHub Releases DTO）
+  - `GitHubReleaseClient`（Releases API 連携）および `AppUpdateService`（アプリ内ダウンロード・バックグラウンド置換・自動再起動）
+  - `UpdateSheetView`、設定シートへの「🚀 アプリ更新」タブ、メイン画面の更新通知バナー、メニューバーの「アップデートを確認...」コマンドを実装
+
+
 
