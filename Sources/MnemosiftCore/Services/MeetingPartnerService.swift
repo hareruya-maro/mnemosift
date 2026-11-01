@@ -9,6 +9,7 @@ public struct LiveDiscussionDigest: Codable, Sendable, Equatable {
     public var actionItems: [ActionItem]
     public var unresolvedQuestions: [String]
     public var utteranceCount: Int
+    public var summaryEngineName: String
     public var updatedAt: Date
 
     public init(
@@ -18,6 +19,7 @@ public struct LiveDiscussionDigest: Codable, Sendable, Equatable {
         actionItems: [ActionItem] = [],
         unresolvedQuestions: [String] = [],
         utteranceCount: Int = 0,
+        summaryEngineName: String = "Apple Intelligence / Local LLM",
         updatedAt: Date = Date()
     ) {
         self.currentTopic = currentTopic
@@ -26,6 +28,7 @@ public struct LiveDiscussionDigest: Codable, Sendable, Equatable {
         self.actionItems = actionItems
         self.unresolvedQuestions = unresolvedQuestions
         self.utteranceCount = utteranceCount
+        self.summaryEngineName = summaryEngineName
         self.updatedAt = updatedAt
     }
 }
@@ -94,7 +97,9 @@ public final class MeetingPartnerService {
 
     public private(set) var liveDigest: LiveDiscussionDigest = LiveDiscussionDigest()
     public private(set) var relatedSuggestions: [RelatedResourceSuggestion] = []
+    public private(set) var isSummarizingWithLLM: Bool = false
     public var previewingSuggestion: RelatedResourceSuggestion?
+    private var llmSummaryTask: Task<Void, Never>?
 
     public init(
         searchService: SearchService,
@@ -112,9 +117,12 @@ public final class MeetingPartnerService {
     public func refreshCopilotContext(
         transcript: Transcript?,
         segments: [TranscriptSegment],
-        activeProjectId: UUID?
+        activeProjectId: UUID?,
+        llmModel: AIModel? = nil
     ) {
         guard !segments.isEmpty else {
+            llmSummaryTask?.cancel()
+            isSummarizingWithLLM = false
             self.liveDigest = LiveDiscussionDigest()
             self.relatedSuggestions = buildInitialProjectSuggestions(projectId: activeProjectId)
             return
@@ -189,15 +197,17 @@ public final class MeetingPartnerService {
             segments: segments
         )
 
-        self.liveDigest = LiveDiscussionDigest(
+        let initialDigest = LiveDiscussionDigest(
             currentTopic: currentTopicHeadline,
             keyPoints: Array(keyPoints.suffix(6)),
             decisions: decisions,
             actionItems: actionItems,
             unresolvedQuestions: unresolved,
             utteranceCount: segments.count,
+            summaryEngineName: llmModel?.name ?? "Apple Intelligence / Local LLM",
             updatedAt: Date()
         )
+        self.liveDigest = initialDigest
 
         // 2. 直近の発話内容から関連資料・過去議事録・用語を自動提案
         let recentText = segments.suffix(3).map(\.correctedText).joined(separator: " ")
@@ -208,6 +218,27 @@ public final class MeetingPartnerService {
             currentTranscriptId: transcript?.id,
             activeProjectId: activeProjectId ?? transcript?.projectIds.first
         )
+
+        // 3. 選択されたLLM（Apple Intelligence FoundationModels または Ollama / MLX ローカルLLM）による非同期AI要約を実行
+        if let activeLLM = llmModel, !LocalLLMAdapter.isRunningUnderTestRunner {
+            llmSummaryTask?.cancel()
+            isSummarizingWithLLM = true
+            let activeProject = projectService.project(for: activeProjectId)
+            llmSummaryTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                let adapter = LocalLLMAdapter(model: activeLLM)
+                if let llmDigest = await adapter.summarizeLiveDiscussionWithLLM(
+                    segments: segments,
+                    project: activeProject,
+                    fallbackDigest: initialDigest
+                ), !Task.isCancelled {
+                    self.liveDigest = llmDigest
+                }
+                if !Task.isCancelled {
+                    self.isSummarizingWithLLM = false
+                }
+            }
+        }
     }
 
     // MARK: - ローカル自然言語要約・要点圧縮ヘルパー

@@ -231,14 +231,43 @@ public struct MeetingPartnerView: View {
                 }
             }
 
-            HStack(spacing: 12) {
+            HStack(spacing: 10) {
                 Picker("音声入力", selection: $selectedAudioSource) {
                     Text("マイク＋システム音声").tag(AudioSourceType.microphoneAndSystem)
                     Text("マイクのみ").tag(AudioSourceType.microphone)
                     Text("システム音声のみ").tag(AudioSourceType.systemAudio)
                 }
                 .controlSize(.small)
-                .frame(width: 210)
+                .frame(width: 195)
+
+                Picker("STTモデル", selection: Binding(
+                    get: { workspace.modelManager.globalSettings.realtimeSTTModelId },
+                    set: { newModelId in
+                        var s = workspace.modelManager.globalSettings
+                        s.realtimeSTTModelId = newModelId
+                        try? workspace.modelManager.updateGlobalSettings(s)
+                        if let model = workspace.modelManager.model(withId: newModelId) {
+                            workspace.recordingService.liveEngine.updateActiveSTTModel(model)
+                        }
+                    }
+                )) {
+                    ForEach(workspace.modelManager.models(for: .stt)) { model in
+                        let statusMark = model.downloadState == .installed ? "" : " [未DL]"
+                        Text("\(model.name)\(statusMark)").tag(model.id)
+                    }
+                }
+                .controlSize(.small)
+                .frame(width: 245)
+
+                if let selectedSTT = workspace.modelManager.model(withId: workspace.modelManager.globalSettings.realtimeSTTModelId),
+                   selectedSTT.downloadState == .notInstalled {
+                    Button("DL", systemImage: "arrow.down.circle.fill") {
+                        workspace.modelManager.startModelDownloadTask(id: selectedSTT.id)
+                    }
+                    .controlSize(.mini)
+                    .buttonStyle(.borderedProminent)
+                    .help("\(selectedSTT.name) をアプリ内にダウンロードします")
+                }
 
                 Picker("AI補正", selection: $selectedCorrectionMode) {
                     ForEach(RealtimeCorrectionMode.allCases) { mode in
@@ -246,7 +275,7 @@ public struct MeetingPartnerView: View {
                     }
                 }
                 .controlSize(.small)
-                .frame(width: 220)
+                .frame(width: 195)
 
                 Spacer()
 
@@ -445,14 +474,39 @@ public struct MeetingPartnerView: View {
         let digest = workspace.meetingPartnerService.liveDigest
 
         return VStack(alignment: .leading, spacing: 10) {
-            HStack {
+            HStack(spacing: 8) {
                 Label("リアルタイム議論要約", systemImage: "brain.head.profile")
                     .font(.headline)
                     .foregroundStyle(.purple)
+
+                if workspace.meetingPartnerService.isSummarizingWithLLM {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("LLM推論中...")
+                        .font(.caption2)
+                        .foregroundStyle(.purple)
+                }
+
                 Spacer()
-                Text("発話 \(digest.utteranceCount)件から自動整理")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+
+                Picker("要約LLM", selection: Binding(
+                    get: { workspace.modelManager.globalSettings.llmModelId },
+                    set: { newLLMId in
+                        var s = workspace.modelManager.globalSettings
+                        s.llmModelId = newLLMId
+                        try? workspace.modelManager.updateGlobalSettings(s)
+                        workspace.refreshMeetingPartnerState()
+                    }
+                )) {
+                    ForEach(workspace.modelManager.models(for: .llm)) { model in
+                        let statusMark = model.downloadState == .installed ? "" : " [未DL]"
+                        Text("\(model.name)\(statusMark)").tag(model.id)
+                    }
+                }
+                .labelsHidden()
+                .controlSize(.small)
+                .frame(width: 215)
+
                 Button("議事録として確定", systemImage: "doc.badge.checkmark") {
                     generateOrUpdateFullMinutes()
                     leftTab = .finalizedMinutes
@@ -467,9 +521,14 @@ public struct MeetingPartnerView: View {
                 Image(systemName: "target")
                     .foregroundStyle(.purple)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("現在の論点・テーマ")
-                        .font(.caption2.bold())
-                        .foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        Text("現在の論点・テーマ")
+                            .font(.caption2.bold())
+                            .foregroundStyle(.secondary)
+                        Text("・ \(digest.summaryEngineName)")
+                            .font(.caption2)
+                            .foregroundStyle(.purple)
+                    }
                     Text(digest.currentTopic)
                         .font(.subheadline.bold())
                 }
@@ -711,7 +770,8 @@ public struct MeetingPartnerView: View {
                     title: sessionTitleInput,
                     source: selectedAudioSource,
                     projectIds: pids,
-                    hotwords: hotwords
+                    hotwords: hotwords,
+                    sttModel: config.realtimeSTTModel
                 )
 
                 let tr = try workspace.sttService.createTranscriptSession(

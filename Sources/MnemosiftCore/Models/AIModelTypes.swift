@@ -24,10 +24,12 @@ public enum AIModelRuntime: String, Codable, CaseIterable, Sendable {
     case qwenASR = "Qwen3-ASR (MLX)"
     case kotobaWhisper = "kotoba-whisper (MLX/Local)"
     case appleNaturalLanguage = "Apple NaturalLanguage"
+    case appleIntelligence = "Apple Intelligence (FoundationModels)"
     case modernBERT = "ModernBERT-Ja (MLX)"
     case gliFormer = "GLiFormer (MLX)"
     case ollama = "Ollama Local Runtime"
     case mlxLLM = "MLX LM Local Runtime"
+    case ggufLocal = "Local GGUF (llama.cpp)"
     case builtInEngine = "Built-in Local Engine"
 }
 

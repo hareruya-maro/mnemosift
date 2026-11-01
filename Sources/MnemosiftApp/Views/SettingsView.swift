@@ -1,12 +1,25 @@
 import SwiftUI
+import AppKit
 import MnemosiftCore
 
 /// 仕様書 §9.7 & §10: 設定・AIモデルマネージャー画面
 /// - 4分類（STT / 判断モデル / LLM / Embedding）のモデル管理（インストール・削除・更新・ディスク使用量・メタデータ表示）
+/// - パワーユーザー向け Hugging Face / Ollama / ローカルGGUF カスタムモデル追加
 /// - 設定の優先順位（1. 実行時指定 → 2. プロジェクト固有設定 → 3. アプリ全体設定）
 /// - 補正モード、確信度閾値、録音デバイス、ローカルデータ保存先、パフォーマンス設定
 public struct SettingsView: View {
     @Bindable var workspace: AppWorkspaceController
+
+    // カスタムモデル追加フォーム用ステート
+    @State private var isShowingCustomModelForm: Bool = false
+    @State private var customModelName: String = ""
+    @State private var customModelCategory: AIModelCategory = .llm
+    @State private var customModelRuntime: AIModelRuntime = .ollama
+    @State private var customModelEndpoint: String = ""
+    @State private var customModelMemoryMB: Int = 4096
+    @State private var customModelDiskMB: Int = 3500
+    @State private var customModelSupportsVocab: Bool = true
+    @State private var customModelNotes: String = ""
 
     public init(workspace: AppWorkspaceController) {
         self.workspace = workspace
@@ -17,6 +30,7 @@ public struct SettingsView: View {
             VStack(alignment: .leading, spacing: 22) {
                 globalAISettingsSection
                 modelManagerCatalogSection
+                customModelAdditionSection
                 storageAndPrivacySection
             }
             .padding(20)
@@ -159,13 +173,19 @@ public struct SettingsView: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("AIモデルマネージャー")
+                    Text("AIモデルマネージャー（推奨モデルのアプリ単体ダウンロード・実行）")
                         .font(.headline)
                     Text("推奨モデルのインストール・更新・削除とメタデータ（ランタイム・必要メモリ・ストリーミング・語彙指定対応）を管理します。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                Button("モデル保存フォルダを開く", systemImage: "folder") {
+                    NSWorkspace.shared.open(workspace.modelManager.modelsDirectoryURL)
+                }
+                .controlSize(.small)
+                .buttonStyle(.bordered)
+
                 Text("総ディスク使用量: \(workspace.modelManager.totalDiskUsageMB) MB")
                     .font(.subheadline.bold())
                     .padding(.horizontal, 10)
@@ -225,36 +245,196 @@ public struct SettingsView: View {
                 }
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+
+                if let statusMsg = workspace.modelManager.downloadStatusMessages[model.id], !statusMsg.isEmpty {
+                    Text("ステータス: \(statusMsg)")
+                        .font(.caption2)
+                        .foregroundStyle(.blue)
+                }
             }
 
             Spacer()
 
             VStack(alignment: .trailing, spacing: 6) {
                 if model.downloadState == .downloading {
-                    ProgressView(value: model.downloadProgress, total: 1.0)
-                        .frame(width: 100)
-                } else if model.downloadState == .notInstalled || model.downloadState == .updateAvailable {
-                    Button(
-                        model.downloadState == .updateAvailable ? "モデル更新" : "インストール",
-                        systemImage: "arrow.down.circle"
-                    ) {
-                        Task {
-                            await workspace.modelManager.installOrUpdateModel(id: model.id)
+                    HStack(spacing: 8) {
+                        ProgressView(value: model.downloadProgress, total: 1.0)
+                            .frame(width: 90)
+                        Text("\(Int(model.downloadProgress * 100))%")
+                            .font(.caption2.monospacedDigit())
+                        Button("中断", systemImage: "xmark.circle") {
+                            workspace.modelManager.cancelModelDownload(id: model.id)
                         }
+                        .controlSize(.mini)
+                        .buttonStyle(.bordered)
+                    }
+                } else if model.downloadState == .notInstalled || model.downloadState == .updateAvailable || model.downloadState == .failed {
+                    Button(
+                        model.downloadState == .updateAvailable ? "モデル更新" : "ダウンロード",
+                        systemImage: "arrow.down.circle.fill"
+                    ) {
+                        workspace.modelManager.startModelDownloadTask(id: model.id)
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                 } else if model.diskSizeMB > 0 {
-                    Button("削除", systemImage: "trash") {
-                        try? workspace.modelManager.deleteModelFromDisk(id: model.id)
+                    HStack(spacing: 6) {
+                        Button("削除", systemImage: "trash") {
+                            try? workspace.modelManager.deleteModelFromDisk(id: model.id)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
                 }
             }
         }
         .padding(12)
         .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private var customModelAdditionSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("パワーユーザー向け：カスタムモデル追加（Hugging Face / Ollama / ローカルGGUF）")
+                        .font(.headline)
+                    Text("Hugging Face の MLX / GGUF リポジトリID、ローカルの Ollama モデルタグ、または `.gguf` ファイルパスを指定してカタログに追加できます。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("ローカルOllamaモデルを検出", systemImage: "arrow.triangle.2.circlepath") {
+                    Task {
+                        let tags = await workspace.modelManager.discoverLocalOllamaModels()
+                        if tags.isEmpty {
+                            workspace.statusBannerMessage = "ローカルで起動中の Ollama モデルは検出されませんでした（127.0.0.1:11434）"
+                        } else {
+                            workspace.statusBannerMessage = "Ollama から \(tags.count) 個のモデルを検出しました"
+                        }
+                    }
+                }
+                .controlSize(.small)
+                .buttonStyle(.bordered)
+
+                Button(isShowingCustomModelForm ? "フォームを閉じる" : "＋ カスタムモデルを追加", systemImage: "plus.circle.fill") {
+                    withAnimation {
+                        isShowingCustomModelForm.toggle()
+                    }
+                }
+                .controlSize(.small)
+                .buttonStyle(.borderedProminent)
+            }
+
+            if !workspace.modelManager.discoveredOllamaTags.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("検出されたローカル Ollama モデル（クリックでワンタッチ登録）:")
+                        .font(.caption.bold())
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(workspace.modelManager.discoveredOllamaTags, id: \.self) { tag in
+                                Button("＋ \(tag)") {
+                                    _ = try? workspace.modelManager.addCustomModel(
+                                        name: "Ollama: \(tag)",
+                                        category: .llm,
+                                        runtime: .ollama,
+                                        endpointOrRepoId: tag,
+                                        requiredMemoryMB: 4096,
+                                        diskSizeMB: 3500,
+                                        notes: "ローカル Ollama から自動検出・登録されたモデル"
+                                    )
+                                    workspace.statusBannerMessage = "Ollama モデル『\(tag)』をカタログに追加しました"
+                                }
+                                .controlSize(.small)
+                                .buttonStyle(.bordered)
+                            }
+                        }
+                    }
+                }
+                .padding(10)
+                .background(.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            }
+
+            if isShowingCustomModelForm {
+                Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 10) {
+                    GridRow {
+                        Text("表示モデル名:")
+                            .font(.subheadline)
+                        TextField("例: Gemma 4 27B Instruct / Llama 3.3 8B", text: $customModelName)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    GridRow {
+                        Text("カテゴリ / ランタイム:")
+                            .font(.subheadline)
+                        HStack(spacing: 12) {
+                            Picker("カテゴリ", selection: $customModelCategory) {
+                                ForEach(AIModelCategory.allCases) { cat in
+                                    Text(cat.rawValue).tag(cat)
+                                }
+                            }
+                            .frame(width: 180)
+
+                            Picker("ランタイム", selection: $customModelRuntime) {
+                                ForEach(AIModelRuntime.allCases, id: \.self) { rt in
+                                    Text(rt.rawValue).tag(rt)
+                                }
+                            }
+                            .frame(width: 260)
+                        }
+                    }
+                    GridRow {
+                        Text("HF Repo / Ollamaタグ / パス:")
+                            .font(.subheadline)
+                        TextField("例: mlx-community/gemma-2-27b-it-4bit または gemma4:27b または ~/Models/model.gguf", text: $customModelEndpoint)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    GridRow {
+                        Text("推定メモリ / ディスク容量:")
+                            .font(.subheadline)
+                        HStack(spacing: 16) {
+                            Stepper("必要メモリ: \(customModelMemoryMB) MB", value: $customModelMemoryMB, in: 256...65536, step: 512)
+                            Stepper("ディスク: \(customModelDiskMB) MB", value: $customModelDiskMB, in: 100...65536, step: 500)
+                            Toggle("語彙指定対応", isOn: $customModelSupportsVocab)
+                        }
+                        .font(.caption)
+                    }
+                    GridRow {
+                        Text("メモ・説明:")
+                            .font(.subheadline)
+                        HStack {
+                            TextField("任意のメモ...", text: $customModelNotes)
+                                .textFieldStyle(.roundedBorder)
+                            Button("カタログに登録してダウンロード", systemImage: "checkmark.circle.fill") {
+                                do {
+                                    let added = try workspace.modelManager.addCustomModel(
+                                        name: customModelName,
+                                        category: customModelCategory,
+                                        runtime: customModelRuntime,
+                                        endpointOrRepoId: customModelEndpoint,
+                                        requiredMemoryMB: customModelMemoryMB,
+                                        diskSizeMB: customModelDiskMB,
+                                        supportsCustomVocabulary: customModelSupportsVocab,
+                                        notes: customModelNotes
+                                    )
+                                    workspace.modelManager.startModelDownloadTask(id: added.id)
+                                    workspace.statusBannerMessage = "カスタムモデル『\(added.name)』を追加しダウンロードを開始しました"
+                                    customModelName = ""
+                                    customModelEndpoint = ""
+                                    customModelNotes = ""
+                                    isShowingCustomModelForm = false
+                                } catch {
+                                    workspace.statusBannerMessage = "⚠️ \(error.localizedDescription)"
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                    }
+                }
+                .padding(12)
+                .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10))
+            }
+        }
+        .padding(16)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 
     private var storageAndPrivacySection: some View {

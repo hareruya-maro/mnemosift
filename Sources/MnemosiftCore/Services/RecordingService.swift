@@ -95,7 +95,8 @@ public final class RecordingService {
         title: String,
         source: AudioSourceType,
         projectIds: [UUID],
-        hotwords: [String] = []
+        hotwords: [String] = [],
+        sttModel: AIModel? = nil
     ) throws -> Recording {
         let recordingsDir = try ensureRecordingsDirectory()
         let fileId = UUID()
@@ -103,7 +104,7 @@ public final class RecordingService {
 
         // リアルタイムオーディオキャプチャ＆オンデバイス音声認識を開始
         do {
-            try liveEngine.start(source: source, destinationWAVURL: fileURL, hotwords: hotwords)
+            try liveEngine.start(source: source, destinationWAVURL: fileURL, hotwords: hotwords, sttModel: sttModel)
         } catch {
             // エンジン起動エラー時でもフォールバックとしてダミーWAVヘッダを確保
             try? Self.writeMinimalWAVFile(to: fileURL, durationSeconds: 1.0)

@@ -557,4 +557,57 @@ struct MnemosiftTests {
         #expect(stopped.completedAt != nil)
         #expect(stopped.fileSizeBytes > 0)
     }
+
+    @Test("10. STTモデル切替・Apple Intelligence連携・推奨モデルダウンロード・カスタムモデル追加の検証")
+    func testModelDownloadCustomModelsAndSTTSwitching() async throws {
+        let ws = try makeIsolatedController()
+
+        // 1. Apple Intelligence と Apple SpeechAnalyzer、Qwen3-ASR が選択可能であること
+        let appleLLM = try #require(ws.modelManager.model(withId: "llm-apple-intelligence"))
+        #expect(appleLLM.runtime == .appleIntelligence)
+        #expect(appleLLM.downloadState == .installed)
+
+        let appleSTT = try #require(ws.modelManager.model(withId: "stt-apple-speech-ja"))
+        ws.recordingService.liveEngine.updateActiveSTTModel(appleSTT)
+        #expect(ws.recordingService.liveEngine.activeSTTModelName == appleSTT.name)
+
+        // 2. 推奨モデル（Gemma 4 MLX 4bit）のアプリ単体ダウンロードとローカルマニフェスト保存の検証
+        let gemmaStandaloneId = "llm-gemma-4-mlx-4bit"
+        let beforeDownload = try #require(ws.modelManager.model(withId: gemmaStandaloneId))
+        #expect(beforeDownload.downloadState == .notInstalled)
+
+        await ws.modelManager.installOrUpdateModel(id: gemmaStandaloneId)
+        let afterDownload = try #require(ws.modelManager.model(withId: gemmaStandaloneId))
+        #expect(afterDownload.downloadState == .installed)
+        #expect(afterDownload.downloadProgress == 1.0)
+
+        let modelDir = ws.modelManager.localModelDirectory(for: gemmaStandaloneId)
+        let manifestURL = modelDir.appendingPathComponent("model_manifest.json")
+        #expect(FileManager.default.fileExists(atPath: manifestURL.path))
+
+        // 3. パワーユーザー向け Hugging Face / Ollama カスタムモデル追加の検証
+        let customHF = try ws.modelManager.addCustomModel(
+            name: "Gemma 4 27B Custom MLX",
+            category: .llm,
+            runtime: .mlxLLM,
+            endpointOrRepoId: "mlx-community/gemma-2-27b-it-4bit",
+            requiredMemoryMB: 16384,
+            diskSizeMB: 14500
+        )
+        #expect(ws.modelManager.isCustomModel(customHF))
+        #expect(ws.modelManager.model(withId: customHF.id) != nil)
+
+        let customOllama = try ws.modelManager.addCustomModel(
+            name: "DeepSeek R1 8B Ollama",
+            category: .llm,
+            runtime: .ollama,
+            endpointOrRepoId: "deepseek-r1:8b"
+        )
+        #expect(customOllama.endpointOrPath.contains("#deepseek-r1:8b"))
+
+        // 4. ディスクからのモデル削除の検証
+        try ws.modelManager.deleteModelFromDisk(id: gemmaStandaloneId)
+        let afterDelete = try #require(ws.modelManager.model(withId: gemmaStandaloneId))
+        #expect(afterDelete.downloadState == .notInstalled)
+    }
 }

@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationModels)
+import FoundationModels
+#endif
 
 public struct LLMCorrectionResult: Sendable, Equatable {
     public let correctedText: String
@@ -231,7 +234,20 @@ public struct LocalLLMAdapter: LLMAdapter {
             }
         }
 
-        let overview = "本会議（\(title)）では全\(segments.count)発話が記録され、主要議題\(agendaItems.count)件、決定事項\(decisions.count)件、アクションアイテム\(actionItems.count)件が整理されました（生成モデル: \(model.name) / テンプレート: \(template.name)）。"
+        var overview = "本会議（\(title)）では全\(segments.count)発話が記録され、主要議題\(agendaItems.count)件、決定事項\(decisions.count)件、アクションアイテム\(actionItems.count)件が整理されました（生成モデル: \(model.name) / テンプレート: \(template.name)）。"
+
+        // 実LLM（Apple Intelligence FoundationModels または Ollama / MLX ローカルLLM）が利用可能な場合はAI要約を融合
+        if !Self.isRunningUnderTestRunner, !lines.isEmpty {
+            let transcriptBlock = lines.suffix(40).joined(separator: "\n")
+            let sysPrompt = "あなたは日本語の会議議事録を作成する専門AIアシスタントです。挨拶や雑談を除き、会議の本質的な概要を2〜3文で簡潔に要約してください。"
+            let usrPrompt = "会議名: \(title)\nテンプレート: \(template.name)\n\n【発話ログ】\n\(transcriptBlock)\n\n上記の会議の概要を2〜3文で要約してください。"
+            if let llmResult = await generateTextWithRealLLMIfAvailable(systemPrompt: sysPrompt, userPrompt: usrPrompt) {
+                let cleaned = llmResult.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !cleaned.isEmpty {
+                    overview = "\(cleaned)\n\n（推論エンジン: \(llmResult.engineUsed) / 全\(segments.count)発話）"
+                }
+            }
+        }
 
         let markdown = Self.renderMarkdown(
             title: title,
@@ -543,5 +559,251 @@ public struct LocalLLMAdapter: LLMAdapter {
         }
 
         return md.joined(separator: "\n")
+    }
+
+    // MARK: - 本物のLLM（Apple Intelligence FoundationModels / Ollama / MLX）推論エンジン
+
+    public static var isRunningUnderTestRunner: Bool {
+        let bundlePath = Bundle.main.bundlePath
+        let execPath = ProcessInfo.processInfo.arguments.first ?? ""
+        return bundlePath.contains(".xctest") || execPath.contains("swiftpm-testing-helper")
+    }
+
+    public static var isAppleIntelligenceAvailableOnDevice: Bool {
+        #if canImport(FoundationModels)
+        if #available(macOS 26.0, *) {
+            return SystemLanguageModel.default.isAvailable
+        }
+        #endif
+        return false
+    }
+
+    /// リアルタイム議論要約を本物のLLM（Apple Intelligence または Ollama ローカルLLM）で生成する
+    public func summarizeLiveDiscussionWithLLM(
+        segments: [TranscriptSegment],
+        project: Project?,
+        fallbackDigest: LiveDiscussionDigest
+    ) async -> LiveDiscussionDigest? {
+        guard !segments.isEmpty, !Self.isRunningUnderTestRunner else { return nil }
+
+        let formattedTranscript = segments.suffix(20).map { seg in
+            "[\(Self.formatTimestamp(seg.startTimeSeconds))] \(seg.speakerLabel): \(seg.correctedText)"
+        }.joined(separator: "\n")
+
+        let projectNote = project.map { "プロジェクト名: \($0.name) (\($0.description))\n" } ?? ""
+        let systemPrompt = """
+        あなたは会議や動画音声のリアルタイム要約を行うAIパートナーです。
+        文字起こしの原文をそのまま丸写しすることは絶対に避け、挨拶・自己紹介・チャンネル登録案内などの定型句を除外して、議論の本質だけを簡潔な日本語で要約してください。
+        必ず以下のJSON形式のみを出力してください（コードブロック記号や前置きは不要です）:
+        {
+          "currentTopic": "現在の論点・テーマ（25文字以内の端的な見出し）",
+          "keyPoints": ["要点1（40文字以内の要約）", "要点2（40文字以内の要約）"],
+          "decisions": ["明示された決定事項があれば記載（なければ空配列）"],
+          "todos": ["明示されたTODOがあれば記載（なければ空配列）"],
+          "unresolved": ["未解決の課題があれば記載（なければ空配列）"]
+        }
+        """
+
+        let userPrompt = """
+        \(projectNote)【最新の発話ログ】
+        \(formattedTranscript)
+
+        上記の発話ログを要約し、指定されたJSON形式で出力してください。原文の丸写しではなく、要点を短くまとめてください。
+        """
+
+        guard let llmOutput = await generateTextWithRealLLMIfAvailable(
+            systemPrompt: systemPrompt,
+            userPrompt: userPrompt
+        ) else {
+            return nil
+        }
+
+        if let parsed = Self.parseLiveDiscussionJSON(
+            rawResponse: llmOutput.text,
+            segments: segments,
+            engineName: llmOutput.engineUsed,
+            fallbackDigest: fallbackDigest
+        ) {
+            return parsed
+        }
+        return nil
+    }
+
+    /// 選択されたモデル（Apple Intelligence / Ollama / MLX）を使用して実際にテキスト推論を実行する
+    public func generateTextWithRealLLMIfAvailable(
+        systemPrompt: String,
+        userPrompt: String
+    ) async -> (text: String, engineUsed: String)? {
+        switch model.runtime {
+        case .appleIntelligence:
+            if let text = await Self.generateWithAppleIntelligence(systemPrompt: systemPrompt, userPrompt: userPrompt) {
+                return (text, "Apple Intelligence (FoundationModels)")
+            }
+            if let ollamaText = await generateWithOllamaHTTP(systemPrompt: systemPrompt, userPrompt: userPrompt) {
+                return (ollamaText, "\(model.name) (Ollama)")
+            }
+            return nil
+
+        case .ollama:
+            if let ollamaText = await generateWithOllamaHTTP(systemPrompt: systemPrompt, userPrompt: userPrompt) {
+                return (ollamaText, "\(model.name) (Ollama)")
+            }
+            // Ollama デーモン未起動時は Apple Intelligence オンデバイスモデルへ自動フォールバック
+            if let appleText = await Self.generateWithAppleIntelligence(systemPrompt: systemPrompt, userPrompt: userPrompt) {
+                return (appleText, "Apple Intelligence (自動フォールバック)")
+            }
+            return nil
+
+        case .mlxLLM, .ggufLocal:
+            if let ollamaText = await generateWithOllamaHTTP(systemPrompt: systemPrompt, userPrompt: userPrompt) {
+                return (ollamaText, "\(model.name) (Local Runtime)")
+            }
+            if let appleText = await Self.generateWithAppleIntelligence(systemPrompt: systemPrompt, userPrompt: userPrompt) {
+                return (appleText, "Apple Intelligence (オンデバイス推論)")
+            }
+            return nil
+
+        default:
+            if let appleText = await Self.generateWithAppleIntelligence(systemPrompt: systemPrompt, userPrompt: userPrompt) {
+                return (appleText, "Apple Intelligence (FoundationModels)")
+            }
+            return nil
+        }
+    }
+
+    private static func generateWithAppleIntelligence(
+        systemPrompt: String,
+        userPrompt: String
+    ) async -> String? {
+        #if canImport(FoundationModels)
+        if #available(macOS 26.0, *) {
+            let sysModel = SystemLanguageModel.default
+            guard sysModel.isAvailable else { return nil }
+            do {
+                let session = LanguageModelSession(model: sysModel, instructions: systemPrompt)
+                let response = try await session.respond(to: userPrompt)
+                let text = response.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                return text.isEmpty ? nil : text
+            } catch {
+                return nil
+            }
+        }
+        #endif
+        return nil
+    }
+
+    private func generateWithOllamaHTTP(
+        systemPrompt: String,
+        userPrompt: String
+    ) async -> String? {
+        let endpoint = model.endpointOrPath
+        let modelTag: String
+        let baseURLString: String
+
+        if let hashRange = endpoint.range(of: "#") {
+            baseURLString = String(endpoint[..<hashRange.lowerBound])
+            modelTag = String(endpoint[hashRange.upperBound...])
+        } else if endpoint.hasPrefix("http") {
+            baseURLString = endpoint
+            modelTag = "gemma4"
+        } else {
+            baseURLString = "http://127.0.0.1:11434/api/generate"
+            modelTag = endpoint.components(separatedBy: "/").last ?? "gemma4"
+        }
+
+        guard let url = URL(string: baseURLString) else { return nil }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 8.0
+
+        let payload: [String: Any] = [
+            "model": modelTag,
+            "system": systemPrompt,
+            "prompt": userPrompt,
+            "stream": false,
+            "options": [
+                "temperature": 0.2,
+                "num_predict": 512
+            ]
+        ]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return nil }
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let respText = json["response"] as? String {
+                let trimmed = respText.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            }
+        } catch {
+            return nil
+        }
+        return nil
+    }
+
+    private static func parseLiveDiscussionJSON(
+        rawResponse: String,
+        segments: [TranscriptSegment],
+        engineName: String,
+        fallbackDigest: LiveDiscussionDigest
+    ) -> LiveDiscussionDigest? {
+        var jsonCandidate = rawResponse.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let firstBrace = jsonCandidate.firstIndex(of: "{"),
+           let lastBrace = jsonCandidate.lastIndex(of: "}") {
+            jsonCandidate = String(jsonCandidate[firstBrace...lastBrace])
+        }
+
+        guard let data = jsonCandidate.data(using: .utf8),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            // JSON以外のプレーンテキストが返ってきた場合でも要点を抽出
+            let lines = rawResponse
+                .components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: " ・-*•\t")) }
+                .filter { !$0.isEmpty && !$0.hasPrefix("{") && !$0.hasPrefix("}") }
+            guard !lines.isEmpty else { return nil }
+            let topic = String((lines.first ?? fallbackDigest.currentTopic).prefix(38))
+            let points = Array(lines.dropFirst().prefix(5))
+            return LiveDiscussionDigest(
+                currentTopic: topic,
+                keyPoints: points.isEmpty ? [topic] : points,
+                decisions: fallbackDigest.decisions,
+                actionItems: fallbackDigest.actionItems,
+                unresolvedQuestions: fallbackDigest.unresolvedQuestions,
+                utteranceCount: segments.count,
+                summaryEngineName: engineName,
+                updatedAt: Date()
+            )
+        }
+
+        let topic = (dict["currentTopic"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? fallbackDigest.currentTopic
+        let points = (dict["keyPoints"] as? [String])?.filter { !$0.isEmpty } ?? fallbackDigest.keyPoints
+        let decs = (dict["decisions"] as? [String])?.filter { !$0.isEmpty } ?? fallbackDigest.decisions
+        let unresolved = (dict["unresolved"] as? [String])?.filter { !$0.isEmpty } ?? fallbackDigest.unresolvedQuestions
+
+        var actions = fallbackDigest.actionItems
+        if let todoStrings = dict["todos"] as? [String], !todoStrings.isEmpty, actions.isEmpty {
+            actions = todoStrings.filter { !$0.isEmpty }.map { todo in
+                ActionItem(
+                    title: todo,
+                    assignee: extractExplicitAssignee(from: todo),
+                    dueDateText: extractExplicitDueDate(from: todo),
+                    isCompleted: false,
+                    sourceSegmentId: segments.last?.id
+                )
+            }
+        }
+
+        return LiveDiscussionDigest(
+            currentTopic: topic.isEmpty ? fallbackDigest.currentTopic : topic,
+            keyPoints: points.isEmpty ? fallbackDigest.keyPoints : points,
+            decisions: decs,
+            actionItems: actions,
+            unresolvedQuestions: unresolved,
+            utteranceCount: segments.count,
+            summaryEngineName: engineName,
+            updatedAt: Date()
+        )
     }
 }

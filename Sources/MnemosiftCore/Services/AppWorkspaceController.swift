@@ -173,10 +173,13 @@ public final class AppWorkspaceController {
         let tr = activeTranscriptId.flatMap { id in sttService.transcripts.first { $0.id == id } }
             ?? sttService.transcripts.first
         let segs = tr.map { sttService.segments(for: $0.id) } ?? []
+        let activeProject = projectService.project(for: selectedProjectId)
+        let config = modelManager.resolveConfiguration(project: activeProject)
         meetingPartnerService.refreshCopilotContext(
             transcript: tr,
             segments: segs,
-            activeProjectId: selectedProjectId
+            activeProjectId: selectedProjectId,
+            llmModel: config.llmModel
         )
     }
 

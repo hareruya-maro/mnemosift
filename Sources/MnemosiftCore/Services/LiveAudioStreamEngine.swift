@@ -21,6 +21,8 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
     private var continuousVoiceFramesCount: Int = 0
     private var hotwords: [String] = []
     private var useOnDeviceRecognition: Bool = false
+    private var selectedSTTModel: AIModel?
+    public private(set) var activeSTTModelName: String = "Apple SpeechAnalyzer"
 
     // 1タスク内での連続差分スライス管理 ＆ 重複防止
     private var committedCharCountInCurrentTask: Int = 0
@@ -124,10 +126,18 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
 
     // MARK: - 録音・文字起こし開始
 
+    public func updateActiveSTTModel(_ sttModel: AIModel) {
+        stateQueue.sync {
+            self.selectedSTTModel = sttModel
+            self.activeSTTModelName = sttModel.name
+        }
+    }
+
     public func start(
         source: AudioSourceType,
         destinationWAVURL: URL,
-        hotwords: [String] = []
+        hotwords: [String] = [],
+        sttModel: AIModel? = nil
     ) throws {
         var startError: Error?
 
@@ -135,6 +145,8 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
             guard !self.isRunningInternal else { return }
 
             self.activeSource = source
+            self.selectedSTTModel = sttModel
+            self.activeSTTModelName = sttModel?.name ?? "Apple SpeechAnalyzer"
             self.sessionStartTime = Date()
             self.lastSpokenTime = Date()
             self.lastResultReceivedTime = Date()
