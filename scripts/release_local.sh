@@ -9,7 +9,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 VERSION=""
-EXTRA_ARGS=()
+SHOULD_NOTARIZE=false
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -18,12 +18,12 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --notarize)
-      EXTRA_ARGS+=("--notarize")
+      SHOULD_NOTARIZE=true
       shift
       ;;
     *)
-      EXTRA_ARGS+=("$1")
-      shift
+      echo "Unknown option: $1"
+      exit 1
       ;;
   esac
 done
@@ -39,7 +39,11 @@ echo "🚀 Mnemosift ローカルリリース開始: $TAG"
 echo "========================================================"
 
 # 1. パッケージングスクリプトを実行 (dist/ 配下に .dmg, .zip, SHA256SUMS.txt を生成)
-./scripts/package_release.sh --version "$VERSION" "${EXTRA_ARGS[@]}"
+if [ "$SHOULD_NOTARIZE" = true ]; then
+  ./scripts/package_release.sh --version "$VERSION" --notarize
+else
+  ./scripts/package_release.sh --version "$VERSION"
+fi
 
 DIST_DIR="$REPO_ROOT/dist"
 ZIP_FILE="$DIST_DIR/Mnemosift-v${VERSION}-macOS-arm64.zip"
