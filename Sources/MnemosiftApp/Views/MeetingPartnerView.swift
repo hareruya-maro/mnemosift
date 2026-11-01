@@ -260,6 +260,24 @@ public struct MeetingPartnerView: View {
                 }
                 .frame(height: 20)
             }
+
+            // システム音声（画面収録）権限チェックバナー
+            if (selectedAudioSource == .systemAudio || selectedAudioSource == .microphoneAndSystem) && !LiveAudioStreamEngine.checkSystemAudioScreenCaptureAccess() {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text("YouTubeやWeb会議の音声を文字起こしするには『画面収録』の許可が必要です。")
+                        .font(.caption)
+                    Spacer()
+                    Button("システム設定を開く") {
+                        openSystemSettingsForScreenCapture()
+                    }
+                    .controlSize(.mini)
+                    .buttonStyle(.borderedProminent)
+                }
+                .padding(8)
+                .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+            }
         }
         .padding(12)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
@@ -668,22 +686,59 @@ public struct MeetingPartnerView: View {
         let pids = workspace.selectedProjectId.map { [$0] } ?? []
         let activeProject = workspace.projectService.project(for: workspace.selectedProjectId)
         let config = workspace.modelManager.resolveConfiguration(project: activeProject)
+        let vocabs = workspace.projectService.activeVocabularies(forProjectIds: pids)
+        let hotwords = vocabs.filter { $0.approvalStatus == .approved }.map(\.canonicalForm)
 
-        guard let rec = try? workspace.recordingService.startRecording(
-            title: sessionTitleInput,
-            source: selectedAudioSource,
-            projectIds: pids
-        ) else { return }
+        Task {
+            // 権限要求
+            let (micGranted, speechGranted) = await LiveAudioStreamEngine.requestPermissions()
+            if !micGranted && (selectedAudioSource == .microphone || selectedAudioSource == .microphoneAndSystem) {
+                workspace.statusBannerMessage = "⚠️ マイクの利用が許可されていません（システム設定でMnemosiftを許可してください）"
+            }
+            if !speechGranted {
+                workspace.statusBannerMessage = "⚠️ オンデバイス音声認識の利用が許可されていません（システム設定で許可してください）"
+            }
 
-        if let tr = try? workspace.sttService.createTranscriptSession(
-            for: rec,
-            sttModelId: config.realtimeSTTModel.id,
-            correctionMode: selectedCorrectionMode
-        ) {
-            workspace.activeTranscriptId = tr.id
-            sessionTitleInput = ""
-            leftTab = .liveTranscript
-            workspace.refreshMeetingPartnerState()
+            if selectedAudioSource == .systemAudio || selectedAudioSource == .microphoneAndSystem {
+                if !LiveAudioStreamEngine.checkSystemAudioScreenCaptureAccess() {
+                    LiveAudioStreamEngine.requestSystemAudioScreenCaptureAccess()
+                    workspace.statusBannerMessage = "⚠️ YouTubeやPC音声を文字起こしするには『画面収録』の許可が必要です"
+                }
+            }
+
+            do {
+                let rec = try workspace.recordingService.startRecording(
+                    title: sessionTitleInput,
+                    source: selectedAudioSource,
+                    projectIds: pids,
+                    hotwords: hotwords
+                )
+
+                let tr = try workspace.sttService.createTranscriptSession(
+                    for: rec,
+                    sttModelId: config.realtimeSTTModel.id,
+                    correctionMode: selectedCorrectionMode
+                )
+
+                workspace.activeTranscriptId = tr.id
+                sessionTitleInput = ""
+                leftTab = .liveTranscript
+                workspace.refreshMeetingPartnerState()
+            } catch {
+                workspace.statusBannerMessage = "録音開始エラー: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func openSystemSettingsForScreenCapture() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func openSystemSettingsForMicrophone() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
+            NSWorkspace.shared.open(url)
         }
     }
 

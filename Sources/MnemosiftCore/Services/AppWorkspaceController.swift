@@ -107,6 +107,49 @@ public final class AppWorkspaceController {
         )
         self.benchmarkRunner = bench
 
+        // リアルタイム音声キャプチャ＆オンデバイス音声認識のコールバック配線
+        recSvc.onProvisionalText = { [weak self] text in
+            guard let self, let trId = self.activeTranscriptId else { return }
+            self.sttService.setProvisionalText(transcriptId: trId, text: text)
+        }
+
+        recSvc.onFinalizedUtterance = { [weak self] text, startSec, endSec in
+            Task { @MainActor in
+                guard let self, let trId = self.activeTranscriptId else { return }
+                let activeProject = self.projectService.project(for: self.selectedProjectId)
+                let config = self.modelManager.resolveConfiguration(project: activeProject)
+                let vocabs = self.projectService.activeVocabularies(forProjectIds: activeProject.map { [$0.id] } ?? [])
+                let projectSnippets = activeProject.map { [$0.description] } ?? []
+
+                _ = try? await self.sttService.processRealtimeUtteranceChunk(
+                    transcriptId: trId,
+                    rawUtteranceText: text,
+                    speakerLabel: "話者",
+                    startTimeSeconds: startSec,
+                    endTimeSeconds: endSec,
+                    sttModel: config.realtimeSTTModel,
+                    correctionMode: config.correctionMode,
+                    vocabularies: vocabs,
+                    projectContextSnippets: projectSnippets,
+                    judgeModel: config.judgeModel,
+                    llmModel: config.llmModel,
+                    confidenceThreshold: config.judgeConfidenceThreshold
+                )
+
+                if let tr = self.sttService.transcripts.first(where: { $0.id == trId }) {
+                    let segs = self.sttService.segments(for: trId)
+                    try? self.embeddingService.indexTranscript(tr, segments: segs)
+                    self.refreshMeetingPartnerState()
+                }
+            }
+        }
+
+        recSvc.onEngineError = { [weak self] errorMsg in
+            Task { @MainActor in
+                self?.statusBannerMessage = "⚠️ \(errorMsg)"
+            }
+        }
+
         if seedDemoDataIfEmpty && sttSvc.transcripts.isEmpty && docSvc.documents.isEmpty {
             Task { @MainActor in
                 try? await self.seedInitialWorkspaceSample()

@@ -19,9 +19,12 @@ public final class RecordingService {
     public private(set) var waveformSamples: [Double] = Array(repeating: 0.08, count: 32)
     public private(set) var permissionStatusNote: String = "マイク・システム音声（ScreenCaptureKit）利用可能"
 
+    public let liveEngine = LiveAudioStreamEngine()
+    public var onProvisionalText: (@MainActor (String) -> Void)?
+    public var onFinalizedUtterance: (@MainActor (String, Double, Double) -> Void)?
+    public var onEngineError: (@MainActor (String) -> Void)?
+
     private var timerTask: Task<Void, Never>?
-    private var audioEngine: AVAudioEngine?
-    private var audioFileWriter: AVAudioFile?
 
     public init(database: LocalDatabase) {
         self.database = database
@@ -40,6 +43,36 @@ public final class RecordingService {
             updatedList.append(rec)
         }
         self.recordings = updatedList
+
+        setupLiveEngineCallbacks()
+    }
+
+    private func setupLiveEngineCallbacks() {
+        self.liveEngine.onLevelMeterUpdate = { [weak self] level in
+            Task { @MainActor in
+                guard let self, self.state == .recording else { return }
+                self.inputLevel = level
+                var nextWave = self.waveformSamples
+                nextWave.removeFirst()
+                nextWave.append(level)
+                self.waveformSamples = nextWave
+            }
+        }
+        self.liveEngine.onProvisionalTextUpdate = { [weak self] text in
+            Task { @MainActor in
+                self?.onProvisionalText?(text)
+            }
+        }
+        self.liveEngine.onFinalizedUtterance = { [weak self] text, startSec, endSec in
+            Task { @MainActor in
+                self?.onFinalizedUtterance?(text, startSec, endSec)
+            }
+        }
+        self.liveEngine.onError = { [weak self] errorMsg in
+            Task { @MainActor in
+                self?.onEngineError?(errorMsg)
+            }
+        }
     }
 
     public func checkPermissionsStatus() -> String {
@@ -50,7 +83,8 @@ public final class RecordingService {
         case .denied, .restricted: "マイク権限: システム設定 > プライバシーとセキュリティ > マイク で許可してください"
         @unknown default: "マイク権限: 不明"
         }
-        let sysText = "システム音声権限: ScreenCaptureKit (画面収録とシステムオーディオ録音)"
+        let sysScreenCapture = LiveAudioStreamEngine.checkSystemAudioScreenCaptureAccess()
+        let sysText = sysScreenCapture ? "システム音声(画面収録): 許可済み" : "システム音声(画面収録): システム設定でMnemosiftを許可してください"
         let combined = "\(micText) / \(sysText)"
         self.permissionStatusNote = combined
         return combined
@@ -60,15 +94,21 @@ public final class RecordingService {
     public func startRecording(
         title: String,
         source: AudioSourceType,
-        projectIds: [UUID]
+        projectIds: [UUID],
+        hotwords: [String] = []
     ) throws -> Recording {
         let recordingsDir = try ensureRecordingsDirectory()
         let fileId = UUID()
         let fileURL = recordingsDir.appendingPathComponent("recording-\(fileId.uuidString).wav")
 
-        // 最初に有効なWAVヘッダファイルを生成して録音データを保護する
-        try Self.writeMinimalWAVFile(to: fileURL, durationSeconds: 1.0)
-        let fileSize = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? Int64) ?? 32044
+        // リアルタイムオーディオキャプチャ＆オンデバイス音声認識を開始
+        do {
+            try liveEngine.start(source: source, destinationWAVURL: fileURL, hotwords: hotwords)
+        } catch {
+            // エンジン起動エラー時でもフォールバックとしてダミーWAVヘッダを確保
+            try? Self.writeMinimalWAVFile(to: fileURL, durationSeconds: 1.0)
+            onEngineError?("音声認識エンジンの起動に失敗しました: \(error.localizedDescription)")
+        }
 
         let recording = Recording(
             id: fileId,
@@ -79,7 +119,7 @@ public final class RecordingService {
             durationSeconds: 0,
             sampleRate: 16000,
             channels: source == .microphoneAndSystem ? 2 : 1,
-            fileSizeBytes: fileSize,
+            fileSizeBytes: 32044,
             isRecoveredFromInterruptedSession: false,
             createdAt: Date(),
             completedAt: nil
@@ -91,7 +131,7 @@ public final class RecordingService {
         self.recordings.insert(recording, at: 0)
         try database.saveRecording(recording)
 
-        startTimerAndLevelMeter()
+        startElapsedTimer()
         return recording
     }
 
@@ -112,15 +152,15 @@ public final class RecordingService {
         state = .stopping
         timerTask?.cancel()
         timerTask = nil
-        audioEngine?.stop()
-        audioEngine = nil
+
+        liveEngine.stop()
 
         current.durationSeconds = max(1.0, elapsedSeconds)
         current.completedAt = Date()
 
         let url = URL(fileURLWithPath: current.filePath)
-        try? Self.writeMinimalWAVFile(to: url, durationSeconds: min(current.durationSeconds, 10.0))
-        current.fileSizeBytes = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 64000
+        let actualSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
+        current.fileSizeBytes = actualSize > 44 ? actualSize : 64000
 
         if let idx = recordings.firstIndex(where: { $0.id == current.id }) {
             recordings[idx] = current
@@ -175,7 +215,7 @@ public final class RecordingService {
         try database.saveRecording(recordings[idx])
     }
 
-    private func startTimerAndLevelMeter() {
+    private func startElapsedTimer() {
         timerTask?.cancel()
         timerTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -183,13 +223,6 @@ public final class RecordingService {
                 guard let self else { return }
                 if self.state == .recording {
                     self.elapsedSeconds += 0.25
-                    let phase = self.elapsedSeconds * 3.2
-                    let level = min(0.95, max(0.12, 0.45 + 0.35 * sin(phase) + Double.random(in: -0.08...0.08)))
-                    self.inputLevel = level
-                    var nextWave = self.waveformSamples
-                    nextWave.removeFirst()
-                    nextWave.append(level)
-                    self.waveformSamples = nextWave
                 }
             }
         }

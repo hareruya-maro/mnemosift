@@ -60,6 +60,27 @@ public final class STTService {
         segmentsByTranscriptId[transcriptId] ?? []
     }
 
+    /// リアルタイムストリーミング認識中の暫定テキストを更新する
+    public func setProvisionalText(transcriptId: UUID, text: String) {
+        if text.isEmpty {
+            self.currentProvisionalSegment = nil
+        } else {
+            let existing = segmentsByTranscriptId[transcriptId] ?? []
+            let seq = existing.count
+            let lastEnd = existing.last?.endTimeSeconds ?? 0.0
+            self.currentProvisionalSegment = TranscriptSegment(
+                transcriptId: transcriptId,
+                sequenceIndex: seq,
+                startTimeSeconds: lastEnd,
+                endTimeSeconds: lastEnd + 1.0,
+                speakerLabel: "認識中",
+                rawText: text,
+                isProvisional: true,
+                sttConfidence: 0.8
+            )
+        }
+    }
+
     /// 仕様書 §5.5: リアルタイム文字起こし＆非同期補正フロー
     /// 1. 音声チャンク取得 → 2. STT逐次認識 → 3. 暫定テキスト表示 → 4. 発話単位確定 → 5. 非同期補正キュー → 6. 補正モデル処理 → 7. 画面反映
     @discardableResult

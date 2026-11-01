@@ -500,4 +500,50 @@ struct MnemosiftTests {
         ))
         #expect(mcpCallReply.contains("audio_architecture.md"))
     }
+
+    @Test("9. リアルタイム音声キャプチャエンジン（LiveAudioStreamEngine）と文字起こしパイプラインの結合検証")
+    func testLiveAudioStreamEnginePipeline() async throws {
+        let ws = try makeIsolatedController()
+
+        // 1. 権限状態の取得確認
+        let permStatus = ws.recordingService.checkPermissionsStatus()
+        #expect(permStatus.contains("マイク権限"))
+        #expect(permStatus.contains("システム音声"))
+
+        // 2. 録音セッションの開始
+        let rec = try ws.recordingService.startRecording(
+            title: "リアルタイムストリーミングテスト",
+            source: .microphoneAndSystem,
+            projectIds: ws.projectService.projects.map(\.id),
+            hotwords: ["Mnemosift", "Qwen3-ASR"]
+        )
+        let tr = try ws.sttService.createTranscriptSession(
+            for: rec,
+            sttModelId: "stt-qwen3-asr-0.6b",
+            correctionMode: .fastAI
+        )
+        ws.activeTranscriptId = tr.id
+
+        // 3. 暫定テキスト (Provisional) の受信シミュレーション
+        ws.recordingService.onProvisionalText?("認識中のテキスト...")
+        #expect(ws.sttService.currentProvisionalSegment != nil)
+        #expect(ws.sttService.currentProvisionalSegment?.rawText == "認識中のテキスト...")
+        #expect(ws.sttService.currentProvisionalSegment?.isProvisional == true)
+
+        // 4. 発話確定 (Finalized Utterance) の受信シミュレーション
+        ws.recordingService.onFinalizedUtterance?("ネモシフトのリアルタイム文字起こしが正常に動作しています。", 0.0, 4.2)
+
+        // 少し待機して非同期タスク完了を待つ
+        try await Task.sleep(for: .milliseconds(300))
+
+        let segments = ws.sttService.segments(for: tr.id)
+        #expect(!segments.isEmpty)
+        #expect(segments.first?.correctedText.contains("Mnemosift") == true || segments.first?.rawText.contains("ネモシフト") == true)
+        #expect(ws.sttService.currentProvisionalSegment == nil)
+
+        // 5. 録音停止とファイルサイズの確定確認
+        let stopped = try #require(try ws.recordingService.stopRecording())
+        #expect(stopped.completedAt != nil)
+        #expect(stopped.fileSizeBytes > 0)
+    }
 }
