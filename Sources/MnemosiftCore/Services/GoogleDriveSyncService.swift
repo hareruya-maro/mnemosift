@@ -2131,9 +2131,9 @@ public final class GoogleDriveSyncService: ObservableObject {
 
     // MARK: - §11 エラー処理・指数バックオフ再試行
 
-    private func executeWithRetry<T>(
+    private func executeWithRetry<T: Sendable>(
         accountId: String,
-        operation: @escaping () async throws -> T
+        operation: () async throws -> T
     ) async throws -> T {
         var attempt = 0
         let maxAttempts = max(1, configuration.maxRetryAttempts)

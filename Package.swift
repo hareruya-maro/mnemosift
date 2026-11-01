@@ -21,6 +21,9 @@ let package = Package(
         .target(
             name: "MnemosiftCore",
             path: "Sources/MnemosiftCore",
+            swiftSettings: [
+                .enableExperimentalFeature("IsolatedDeinit")
+            ],
             linkerSettings: [
                 .linkedLibrary("sqlite3"),
                 .linkedFramework("AVFoundation"),
