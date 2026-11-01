@@ -32,6 +32,7 @@ public final class AppWorkspaceController {
     public var selectedDocumentId: UUID?
     public var highlightedSegmentId: UUID?
     public var statusBannerMessage: String?
+    private var lastRealtimeFinalizedKey: String = ""
 
     public init(databasePath: String? = nil, seedDemoDataIfEmpty: Bool = true) throws {
         let db = try LocalDatabase(databasePath: databasePath)
@@ -114,8 +115,14 @@ public final class AppWorkspaceController {
         }
 
         recSvc.onFinalizedUtterance = { [weak self] text, startSec, endSec in
+            guard let self, let trId = self.activeTranscriptId else { return }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            let dedupKey = "\(trId.uuidString)::\(trimmed)"
+            guard dedupKey != self.lastRealtimeFinalizedKey else { return }
+            self.lastRealtimeFinalizedKey = dedupKey
+
             Task { @MainActor in
-                guard let self, let trId = self.activeTranscriptId else { return }
                 let activeProject = self.projectService.project(for: self.selectedProjectId)
                 let config = self.modelManager.resolveConfiguration(project: activeProject)
                 let vocabs = self.projectService.activeVocabularies(forProjectIds: activeProject.map { [$0.id] } ?? [])
@@ -123,7 +130,7 @@ public final class AppWorkspaceController {
 
                 _ = try? await self.sttService.processRealtimeUtteranceChunk(
                     transcriptId: trId,
-                    rawUtteranceText: text,
+                    rawUtteranceText: trimmed,
                     speakerLabel: "話者",
                     startTimeSeconds: startSec,
                     endTimeSeconds: endSec,

@@ -530,16 +530,27 @@ struct MnemosiftTests {
         #expect(ws.sttService.currentProvisionalSegment?.rawText == "認識中のテキスト...")
         #expect(ws.sttService.currentProvisionalSegment?.isProvisional == true)
 
-        // 4. 発話確定 (Finalized Utterance) の受信シミュレーション
-        ws.recordingService.onFinalizedUtterance?("ネモシフトのリアルタイム文字起こしが正常に動作しています。", 0.0, 4.2)
+        // 4. 発話確定 (Finalized Utterance) の受信シミュレーション ＆ 重複防止・要約圧縮の検証
+        let youtubeSample = "こんにちはAIスクール太田のビジネス変革スイッチへようこそAIスクールの太田ですこのチャンネルではAIのビジネス活用を考えの方に役立つ情報をお届けしています概要欄のリンクもぜひご覧くださいそれでは早速見ていきましょう"
+        let formattedSample = LiveAudioStreamEngine.formatJapanesePunctuation(youtubeSample)
+        #expect(formattedSample.contains("。"))
+
+        ws.recordingService.onFinalizedUtterance?(formattedSample, 0.0, 27.0)
+        // 同一内容が重複して飛んできた場合でも1件に抑えられることを検証
+        ws.recordingService.onFinalizedUtterance?(formattedSample, 27.0, 28.0)
 
         // 少し待機して非同期タスク完了を待つ
-        try await Task.sleep(for: .milliseconds(300))
+        try await Task.sleep(for: .milliseconds(350))
 
         let segments = ws.sttService.segments(for: tr.id)
-        #expect(!segments.isEmpty)
-        #expect(segments.first?.correctedText.contains("Mnemosift") == true || segments.first?.rawText.contains("ネモシフト") == true)
+        #expect(segments.count == 1)
         #expect(ws.sttService.currentProvisionalSegment == nil)
+
+        // リアルタイム議論要約が原文の丸写しではなく、挨拶を除去して要点に圧縮されていることを確認
+        let digest = ws.meetingPartnerService.liveDigest
+        #expect(digest.currentTopic.count < youtubeSample.count)
+        #expect(!digest.currentTopic.contains("概要欄のリンク"))
+        #expect(digest.keyPoints.first?.contains("AIのビジネス活用") == true)
 
         // 5. 録音停止とファイルサイズの確定確認
         let stopped = try #require(try ws.recordingService.stopRecording())

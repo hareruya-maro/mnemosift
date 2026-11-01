@@ -1,4 +1,5 @@
 import Foundation
+import NaturalLanguage
 import Observation
 
 public struct LiveDiscussionDigest: Codable, Sendable, Equatable {
@@ -81,7 +82,8 @@ public struct RelatedResourceSuggestion: Codable, Sendable, Identifiable, Equata
 }
 
 /// 「会議のAIパートナー」コパイロットサービス
-/// - リアルタイム文字起こしの進行に合わせて「議論のライブ要約」と「関連資料・過去議事録・専門用語の自動提案」を即時更新する
+/// - リアルタイム文字起こしの進行に合わせて「議論のライブ要約（要点圧縮・挨拶除去・論点抽出）」と
+///   「関連資料・過去議事録・専門用語の自動提案」を即時更新する
 @Observable
 @MainActor
 public final class MeetingPartnerService {
@@ -118,50 +120,78 @@ public final class MeetingPartnerService {
             return
         }
 
-        // 1. リアルタイム議論要約の構築
-        var topics: [String] = []
+        // 1. 発話を文単位に分割し、挨拶・定型句を除いて構造化要約を生成
+        var explicitTopics: [String] = []
         var keyPoints: [String] = []
         var decisions: [String] = []
         var actionItems: [ActionItem] = []
         var unresolved: [String] = []
+        var seenSummaries: Set<String> = []
 
         for seg in segments {
-            let text = seg.correctedText.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { continue }
+            let formatted = LiveAudioStreamEngine.formatJapanesePunctuation(seg.correctedText)
+            let sentences = Self.splitIntoSentences(formatted)
             let timeStr = LocalLLMAdapter.formatTimestamp(seg.startTimeSeconds)
 
-            if text.contains("議題") || text.contains("テーマ") || text.contains("確認します") || text.contains("について") {
-                topics.append(text)
-            }
-            if text.contains("決定") || text.contains("採用") || text.contains("方針") || text.contains("合意") || text.contains("こととします") {
-                decisions.append("[\(timeStr)] \(text)")
-            } else if text.contains("TODO") || text.contains("アクション") || text.contains("までに") || text.contains("実施します") || text.contains("対応します") {
-                let assignee = LocalLLMAdapter.extractExplicitAssignee(from: text)
-                let due = LocalLLMAdapter.extractExplicitDueDate(from: text)
-                actionItems.append(
-                    ActionItem(
-                        title: text,
-                        assignee: assignee,
-                        dueDateText: due,
-                        isCompleted: false,
-                        sourceSegmentId: seg.id
+            for rawSentence in sentences {
+                let sentence = rawSentence.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !sentence.isEmpty else { continue }
+
+                // 挨拶・自己紹介・リンク案内等のメタ発話は要点リストからスキップ
+                if Self.isGreetingOrMetaFiller(sentence) {
+                    continue
+                }
+
+                let compressed = Self.compressSentenceToKeyPoint(sentence)
+                guard !compressed.isEmpty, !seenSummaries.contains(compressed) else { continue }
+
+                if sentence.contains("議題") || sentence.contains("テーマ") || sentence.contains("本題") {
+                    explicitTopics.append(compressed)
+                }
+
+                if sentence.contains("決定") || sentence.contains("採用") || sentence.contains("方針") || sentence.contains("合意") || sentence.contains("こととします") {
+                    seenSummaries.insert(compressed)
+                    decisions.append("[\(timeStr)] \(compressed)")
+                } else if sentence.contains("TODO") || sentence.contains("アクション") || sentence.contains("までに") || sentence.contains("実施します") || sentence.contains("対応します") {
+                    seenSummaries.insert(compressed)
+                    let assignee = LocalLLMAdapter.extractExplicitAssignee(from: sentence)
+                    let due = LocalLLMAdapter.extractExplicitDueDate(from: sentence)
+                    actionItems.append(
+                        ActionItem(
+                            title: compressed,
+                            assignee: assignee,
+                            dueDateText: due,
+                            isCompleted: false,
+                            sourceSegmentId: seg.id
+                        )
                     )
-                )
-            } else if text.contains("課題") || text.contains("未解決") || text.contains("検討中") || text.contains("保留") {
-                unresolved.append("[\(timeStr)] \(text)")
-            } else {
-                keyPoints.append("[\(timeStr)] \(seg.speakerLabel): \(text)")
+                } else if sentence.contains("課題") || sentence.contains("未解決") || sentence.contains("検討中") || sentence.contains("保留") {
+                    seenSummaries.insert(compressed)
+                    unresolved.append("[\(timeStr)] \(compressed)")
+                } else {
+                    seenSummaries.insert(compressed)
+                    keyPoints.append("[\(timeStr)] \(compressed)")
+                }
             }
         }
 
-        let latestTopic = topics.last ?? segments.last?.correctedText ?? "議論進行中"
-        if keyPoints.isEmpty {
-            keyPoints = segments.suffix(3).map { "[\(LocalLLMAdapter.formatTimestamp($0.startTimeSeconds))] \($0.speakerLabel): \($0.correctedText)" }
+        // もし発話が挨拶のみだった場合のフォールバック要約
+        if keyPoints.isEmpty && decisions.isEmpty && actionItems.isEmpty, let lastSeg = segments.last {
+            let fallbackSummary = Self.compressSentenceToKeyPoint(lastSeg.correctedText)
+            let timeStr = LocalLLMAdapter.formatTimestamp(lastSeg.startTimeSeconds)
+            keyPoints.append("[\(timeStr)] \(fallbackSummary)")
         }
+
+        // 現在の論点・テーマ（長文の丸写しではなく、端的なトピック見出しを生成）
+        let currentTopicHeadline = Self.buildConciseTopicHeadline(
+            explicitTopics: explicitTopics,
+            keyPoints: keyPoints,
+            segments: segments
+        )
 
         self.liveDigest = LiveDiscussionDigest(
-            currentTopic: latestTopic,
-            keyPoints: Array(keyPoints.suffix(5)),
+            currentTopic: currentTopicHeadline,
+            keyPoints: Array(keyPoints.suffix(6)),
             decisions: decisions,
             actionItems: actionItems,
             unresolvedQuestions: unresolved,
@@ -169,7 +199,7 @@ public final class MeetingPartnerService {
             updatedAt: Date()
         )
 
-        // 2. 直近の発話内容（最新3発話を重点、全体も補助）から関連資料・過去議事録・用語を自動提案
+        // 2. 直近の発話内容から関連資料・過去議事録・用語を自動提案
         let recentText = segments.suffix(3).map(\.correctedText).joined(separator: " ")
         let allText = segments.map(\.correctedText).joined(separator: " ")
         self.relatedSuggestions = computeRelatedSuggestions(
@@ -178,6 +208,194 @@ public final class MeetingPartnerService {
             currentTranscriptId: transcript?.id,
             activeProjectId: activeProjectId ?? transcript?.projectIds.first
         )
+    }
+
+    // MARK: - ローカル自然言語要約・要点圧縮ヘルパー
+
+    /// テキストを文単位（「。」「！」「？」）に分割する
+    public static func splitIntoSentences(_ text: String) -> [String] {
+        let normalized = text
+            .replacingOccurrences(of: "！", with: "。")
+            .replacingOccurrences(of: "？", with: "。")
+            .replacingOccurrences(of: "\n", with: "。")
+        return normalized
+            .split(separator: "。")
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    /// 挨拶・チャンネル定型句・メタ発言かどうかを判定する
+    public static func isGreetingOrMetaFiller(_ sentence: String) -> Bool {
+        let s = sentence.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.count <= 4 { return true }
+
+        let pureFillerPatterns = [
+            "ようこそ", "概要欄のリンク", "ぜひご覧ください", "チャンネル登録",
+            "高評価", "早速見ていきましょう", "さっそく見ていきましょう",
+            "お疲れ様です", "よろしくお願いします", "よろしくお願いいたします",
+            "ありがとうございました", "では始めます"
+        ]
+        // 短めの自己紹介・挨拶文（「〜の太田です」「こんにちは〜」等）で実質トピックを含まないものを除外
+        if pureFillerPatterns.contains(where: { s.contains($0) }) && s.count < 38 {
+            return true
+        }
+        if (s.hasPrefix("こんにちは") || s.hasPrefix("こんばんは") || s.hasPrefix("おはようございます")) && s.count < 28 {
+            return true
+        }
+        if s.hasSuffix("です") && s.count <= 16 && !s.contains("決定") && !s.contains("課題") && !s.contains("方針") {
+            return true
+        }
+        return false
+    }
+
+    /// 話し言葉の1文から挨拶・冗長表現を削ぎ落とし、簡潔な要点（体言止め・要約調）に圧縮する
+    public static func compressSentenceToKeyPoint(_ sentence: String) -> String {
+        var s = sentence.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else { return "" }
+
+        // 1. 冒頭に含まれがちな挨拶・フィラー前置きを除去
+        let leadingNoisePrefixes = [
+            "こんにちは。", "こんにちは、", "こんにちは",
+            "それでは、", "それでは", "さて、", "えーと、", "あのー、",
+            "ちなみに、", "まず、", "このチャンネルでは、", "このチャンネルでは",
+            "今回の動画では、", "今回の動画では", "本日の議題として、", "本日は、"
+        ]
+        for prefix in leadingNoisePrefixes {
+            if s.hasPrefix(prefix) && s.count > prefix.count + 4 {
+                s = String(s.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+
+        // 「〜へようこそ」「〜の〇〇です」が文頭に結合している場合は後ろの本題だけを取り出す
+        if let welcomeRange = s.range(of: "ようこそ") {
+            let after = String(s[welcomeRange.upperBound...]).trimmingCharacters(in: CharacterSet(charactersIn: "。、 "))
+            if after.count >= 8 {
+                s = after
+            }
+        }
+
+        // 2. 文末の冗長な話し言葉表現を簡潔な要約調（体言止め等）に置換
+        let suffixReplacements: [(target: String, replacement: String)] = [
+            ("をお届けしています", "の情報を提供"),
+            ("をお届けします", "の情報を提供"),
+            ("について解説していきます", "の解説"),
+            ("について解説します", "の解説"),
+            ("についてお話しします", "についての議論"),
+            ("について説明します", "の説明"),
+            ("を確認します", "の確認"),
+            ("かなと思います", ""),
+            ("だと思います", ""),
+            ("と考えています", ""),
+            ("となっております", ""),
+            ("になっています", ""),
+            ("ということです", ""),
+            ("ことができます", "が可能"),
+            ("していきます", "を推進"),
+            ("見ていきましょう", "の確認")
+        ]
+        for item in suffixReplacements {
+            if s.hasSuffix(item.target) && s.count > item.target.count + 4 {
+                s = String(s.dropLast(item.target.count)) + item.replacement
+                break
+            }
+        }
+
+        // 3. 「考えの方に」→「検討層向けに」等の自然な圧縮
+        s = s.replacingOccurrences(of: "を考えの方に", with: "を検討する層へ")
+            .replacingOccurrences(of: "をお考えの方に", with: "を検討する層へ")
+
+        // 長すぎる場合は60文字でスマートに丸める
+        if s.count > 62 {
+            let idx = s.index(s.startIndex, offsetBy: 60)
+            s = String(s[..<idx]) + "…"
+        }
+        return s
+    }
+
+    /// 発話群から主要キーワード（名詞句・専門用語）を抽出し、35文字以内の端的な「現在の論点・テーマ」見出しを生成する
+    public static func buildConciseTopicHeadline(
+        explicitTopics: [String],
+        keyPoints: [String],
+        segments: [TranscriptSegment]
+    ) -> String {
+        if let lastExplicit = explicitTopics.last, lastExplicit.count <= 42 {
+            return lastExplicit
+        }
+
+        // 直近3セグメントから NLTagger とパターン抽出で重要キーワード（名詞・専門用語）を抽出
+        let recentText = segments.suffix(3).map(\.correctedText).joined(separator: "。")
+        let keywords = extractSalientTopicKeywords(from: recentText)
+
+        // 直近の要点からタイムスタンプ `[00:00] ` を除いた本文を取得
+        if let latestPoint = keyPoints.last {
+            let cleanPoint: String
+            if let bracketEnd = latestPoint.range(of: "] ") {
+                cleanPoint = String(latestPoint[bracketEnd.upperBound...])
+            } else {
+                cleanPoint = latestPoint
+            }
+            if cleanPoint.count <= 36 {
+                return cleanPoint
+            }
+            if !keywords.isEmpty {
+                return "\(keywords.prefix(3).joined(separator: "・")) に関する議論"
+            }
+            let idx = cleanPoint.index(cleanPoint.startIndex, offsetBy: 34)
+            return String(cleanPoint[..<idx]) + "…"
+        }
+
+        if !keywords.isEmpty {
+            return "\(keywords.prefix(3).joined(separator: "・")) について"
+        }
+
+        return "導入・オープニング"
+    }
+
+    /// NaturalLanguage (NLTagger) を用いてテキストから重要キーワード・名詞を抽出する
+    public static func extractSalientTopicKeywords(from text: String) -> [String] {
+        guard !text.isEmpty else { return [] }
+        let stopWords: Set<String> = [
+            "こと", "もの", "ため", "よう", "ところ", "これ", "それ", "あれ", "ここ", "そこ",
+            "わたし", "私", "僕", "今日", "本日", "今回", "チャンネル", "動画", "リンク", "概要欄",
+            "皆さん", "みな", "方", "ようこそ", "挨拶", "話者", "確認", "実施", "対応"
+        ]
+
+        var results: [String] = []
+        let tagger = NLTagger(tagSchemes: [.lexicalClass])
+        tagger.string = text
+
+        var currentCompound = ""
+        tagger.enumerateTags(
+            in: text.startIndex..<text.endIndex,
+            unit: .word,
+            scheme: .lexicalClass,
+            options: [.omitWhitespace, .omitPunctuation]
+        ) { tag, tokenRange in
+            let token = String(text[tokenRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if tag == .noun || tag == .otherWord {
+                if !stopWords.contains(token) && token.count >= 2 {
+                    if currentCompound.count + token.count <= 14 {
+                        currentCompound += token
+                    } else {
+                        if currentCompound.count >= 2 && !results.contains(currentCompound) {
+                            results.append(currentCompound)
+                        }
+                        currentCompound = token
+                    }
+                }
+            } else {
+                if currentCompound.count >= 2 && !stopWords.contains(currentCompound) && !results.contains(currentCompound) {
+                    results.append(currentCompound)
+                }
+                currentCompound = ""
+            }
+            return true
+        }
+        if currentCompound.count >= 2 && !stopWords.contains(currentCompound) && !results.contains(currentCompound) {
+            results.append(currentCompound)
+        }
+
+        return Array(results.prefix(5))
     }
 
     private func computeRelatedSuggestions(
@@ -193,7 +411,6 @@ public final class MeetingPartnerService {
             forProjectIds: activeProjectId.map { [$0] } ?? projectService.projects.map(\.id)
         )
 
-        // 発話中に登場した重要キーワード・専門用語を抽出
         var activeKeywords: [String] = []
         for vocab in vocabs {
             if recentUtteranceText.localizedCaseInsensitiveContains(vocab.canonicalForm) ||
@@ -202,7 +419,7 @@ public final class MeetingPartnerService {
             }
         }
 
-        let fallbackTopicWords = ["STT", "Qwen3-ASR", "WhisperKit", "Gemma 4", "ScreenCaptureKit", "SQLite", "FTS5", "仕様", "アーキテクチャ", "メモリ", "録音", "議事録"]
+        let fallbackTopicWords = ["STT", "Qwen3-ASR", "WhisperKit", "Gemma 4", "ScreenCaptureKit", "SQLite", "FTS5", "仕様", "アーキテクチャ", "メモリ", "録音", "議事録", "AI", "ビジネス"]
         for word in fallbackTopicWords where (recentUtteranceText.localizedCaseInsensitiveContains(word) || fullTranscriptText.localizedCaseInsensitiveContains(word)) && !activeKeywords.contains(word) {
             activeKeywords.append(word)
         }
@@ -216,7 +433,6 @@ public final class MeetingPartnerService {
             limit: 12
         )
 
-        // (A) 検索ヒットしたローカル資料 (Document) と 過去議事録 (Meeting) を提案リストへ変換
         for item in rankedChunks {
             switch item.chunk.sourceType {
             case .document:
@@ -269,7 +485,6 @@ public final class MeetingPartnerService {
             }
         }
 
-        // もし登録済みドキュメントがあるのにまだ含まれていない場合は、キーワード一致で補完
         for doc in documentService.documents where !seenSourceIds.contains(doc.id) {
             let matchedKWs = activeKeywords.filter { doc.extractedText.localizedCaseInsensitiveContains($0) || doc.fileName.localizedCaseInsensitiveContains($0) }
             if !matchedKWs.isEmpty {
@@ -290,7 +505,6 @@ public final class MeetingPartnerService {
             }
         }
 
-        // (B) 会話中に登場した専門用語のクイック解説カードも提案
         for vocab in vocabs where activeKeywords.contains(vocab.canonicalForm) {
             guard !seenSourceIds.contains(vocab.id) else { continue }
             seenSourceIds.insert(vocab.id)
