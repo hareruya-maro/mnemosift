@@ -35,7 +35,7 @@ let package = Package(
             name: "MnemosiftApp",
             dependencies: ["MnemosiftCore"],
             path: "Sources/MnemosiftApp",
-            exclude: ["Info.plist"],
+            exclude: ["Info.plist", "Mnemosift.entitlements"],
             resources: [
                 .copy("Resources/AppIcon.icns"),
                 .copy("Resources/AppIcon.png")

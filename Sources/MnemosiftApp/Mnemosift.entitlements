@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Hardened Runtime & JIT / メモリ実行 (ML推論・動的最適化用) -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
+    <!-- マイク・音声キャプチャ (会議のリアルタイム文字起こし) -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+
+    <!-- ネットワーク外向き通信 (Google Drive同期・GitHub Releases自動更新チェック・モデルダウンロード) -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+</dict>
+</plist>

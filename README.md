@@ -29,7 +29,8 @@ Mnemosift は、会議中にリアルタイム文字起こしと議論の要約�
 - **`Mnemosift-macOS-arm64.zip`**: 解凍して `/Applications` へ配置。
 
 > [!NOTE]
-> 初回起動時に「開発元を検証できないため開けません」と表示された場合は、Finder で `Mnemosift.app` を右クリック（Controlクリック）して「開く」を選択してください。
+> Apple Developer ID による公証チケット（Notarization Staple）が付与されているため、誰でもセキュリティ警告なしでダブルクリック一発で起動できます（※未公証のローカルビルド版などの場合は、初回のみ右クリックして「開く」を選択してください）。
+> GitHub Actions での自動公証セットアップ手順は [Apple 公証セットアップガイド](docs/NOTARIZATION_SETUP.md) をご覧ください。
 
 ### 2. アプリ内自動更新
 - **起動時自動チェック**: アプリ起動時に最新の GitHub Release をバックグラウンドで自動確認します（「⚙️ 設定 > 🚀 アプリ更新」から ON/OFF 切り替え可能）。

@@ -2,10 +2,11 @@
 set -euo pipefail
 
 # Mnemosift macOS アプリケーションバンドルビルドスクリプト
-# 使用法: ./scripts/build_app.sh [--configuration release|debug] [--version 0.1.0]
+# 使用法: ./scripts/build_app.sh [--configuration release|debug] [--version 0.1.0] [--identity "Developer ID Application: ..."]
 
 CONFIGURATION="release"
 CUSTOM_VERSION=""
+SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY:--}"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -15,6 +16,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --version|-v)
       CUSTOM_VERSION="$2"
+      shift 2
+      ;;
+    --identity|-i)
+      SIGNING_IDENTITY="$2"
       shift 2
       ;;
     *)
@@ -81,13 +86,24 @@ else
   cp "$INFO_PLIST_SRC" "$INFO_PLIST_DST"
 fi
 
-# 4. アイコンをファインダーに認識させる
-if command -v sips &> /dev/null && [ -f "$RESOURCES_DIR/AppIcon.icns" ]; then
-  echo "==> Applying app icon..."
+# 4. コード署名 (Ad-hoc または Apple Developer ID + Hardened Runtime)
+ENTITLEMENTS="$REPO_ROOT/Sources/MnemosiftApp/Mnemosift.entitlements"
+
+if [ "$SIGNING_IDENTITY" != "-" ]; then
+  echo "==> Signing with Developer ID: $SIGNING_IDENTITY (Hardened Runtime + Timestamp)"
+  codesign --force --deep --options runtime \
+    --entitlements "$ENTITLEMENTS" \
+    --timestamp \
+    --sign "$SIGNING_IDENTITY" \
+    "$APP_BUNDLE"
+else
+  echo "==> Signing with Ad-hoc signature (local development mode)..."
+  codesign --force --deep --sign - \
+    --entitlements "$ENTITLEMENTS" \
+    "$APP_BUNDLE"
 fi
 
-# 5. Ad-hoc コード署名（TCC・マイク・画面収録権限がInfo.plistと一致するために必要）
-echo "==> Signing app bundle with ad-hoc signature..."
-codesign --force --deep --sign - "$APP_BUNDLE"
+# 署名の検証
+codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 
-echo "✅ Successfully built: $APP_BUNDLE"
+echo "✅ Successfully built and signed: $APP_BUNDLE"
