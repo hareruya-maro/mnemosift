@@ -10,6 +10,10 @@
     <string>Mnemosift</string>
     <key>CFBundleExecutable</key>
     <string>Mnemosift</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -18,6 +22,8 @@
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>会議の音声を録音し、ローカルAIでリアルタイムに文字起こしするためにマイクを使用します。</string>
     <key>NSSpeechRecognitionUsageDescription</key>

@@ -36,6 +36,10 @@ let package = Package(
             dependencies: ["MnemosiftCore"],
             path: "Sources/MnemosiftApp",
             exclude: ["Info.plist"],
+            resources: [
+                .copy("Resources/AppIcon.icns"),
+                .copy("Resources/AppIcon.png")
+            ],
             linkerSettings: [
                 .unsafeFlags([
                     "-Xlinker", "-sectcreate",

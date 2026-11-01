@@ -57,12 +57,19 @@ public struct MainWorkspaceView: View {
 
     private var topUnifiedHeaderBar: some View {
         HStack(spacing: 16) {
-            // 左側: アプリ名 ＋ プロジェクト文脈切替フィルタ
+            // 左側: アプリアイコン・名前 ＋ プロジェクト文脈切替フィルタ
             HStack(spacing: 10) {
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(.green)
-                        .frame(width: 8, height: 8)
+                HStack(spacing: 8) {
+                    if let appIcon = MnemosiftApp.loadAppIconImage() {
+                        Image(nsImage: appIcon)
+                            .resizable()
+                            .interpolation(.high)
+                            .frame(width: 24, height: 24)
+                    } else {
+                        Circle()
+                            .fill(.green)
+                            .frame(width: 8, height: 8)
+                    }
                     Text("Mnemosift")
                         .font(.headline.bold())
                 }

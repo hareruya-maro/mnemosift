@@ -50,11 +50,14 @@ struct MnemosiftApp: App {
 
         // 2. `swift run Mnemosift` 等でターミナルから非 .app バンドルとして直接起動された場合、
         //    macOS TCC のプライバシー強制終了 (__TCC_CRASHING_DUE_TO_PRIVACY_VIOLATION__) を防ぐため、
-        //    自動的に Mnemosift.app バンドルを生成・更新して LaunchServices 経由で起動する
+        //    自動的に Mnemosift.app バンドル（アプリアイコン付き）を生成・更新して LaunchServices 経由で起動する
         Self.relaunchInsideAppBundleIfNeeded()
 
-        // 3. GUI アプリとしてウィンドウを前面化
+        // 3. GUI アプリとしてアイコン適用＆ウィンドウを前面化
         NSApplication.shared.setActivationPolicy(.regular)
+        if let icon = Self.loadAppIconImage() {
+            NSApplication.shared.applicationIconImage = icon
+        }
         NSApplication.shared.activate(ignoringOtherApps: true)
 
         let controller = (try? AppWorkspaceController()) ?? {
@@ -73,13 +76,33 @@ struct MnemosiftApp: App {
         .windowResizability(.contentMinSize)
     }
 
+    /// アプリアイコン画像を読み込む
+    public static func loadAppIconImage() -> NSImage? {
+        if let icnsURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+           let img = NSImage(contentsOf: icnsURL) {
+            return img
+        }
+        if let pngURL = Bundle.main.url(forResource: "AppIcon", withExtension: "png"),
+           let img = NSImage(contentsOf: pngURL) {
+            return img
+        }
+        if let modulePNG = Bundle.module.url(forResource: "AppIcon", withExtension: "png"),
+           let img = NSImage(contentsOf: modulePNG) {
+            return img
+        }
+        if let moduleICNS = Bundle.module.url(forResource: "AppIcon", withExtension: "icns"),
+           let img = NSImage(contentsOf: moduleICNS) {
+            return img
+        }
+        return nil
+    }
+
     /// 非 .app バンドルからの実行時に Mnemosift.app を自動生成して LaunchServices (`open -W`) で起動する
     private static func relaunchInsideAppBundleIfNeeded() {
         let env = ProcessInfo.processInfo.environment
         guard env["MNEMOSIFT_NO_RELAUNCH"] != "1" else { return }
 
         let bundlePath = Bundle.main.bundlePath
-        // すでに .app バンドルとして動作している場合はそのまま続行
         if bundlePath.hasSuffix(".app") {
             return
         }
@@ -92,16 +115,38 @@ struct MnemosiftApp: App {
         let appBundleURL = buildDir.appendingPathComponent("Mnemosift.app", isDirectory: true)
         let contentsURL = appBundleURL.appendingPathComponent("Contents", isDirectory: true)
         let macOSURL = contentsURL.appendingPathComponent("MacOS", isDirectory: true)
+        let resourcesURL = contentsURL.appendingPathComponent("Resources", isDirectory: true)
         let bundledExecURL = macOSURL.appendingPathComponent("Mnemosift")
         let infoPlistURL = contentsURL.appendingPathComponent("Info.plist")
 
         do {
             try FileManager.default.createDirectory(at: macOSURL, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: resourcesURL, withIntermediateDirectories: true)
 
             if FileManager.default.fileExists(atPath: bundledExecURL.path) {
                 try FileManager.default.removeItem(at: bundledExecURL)
             }
             try FileManager.default.copyItem(at: execURL, to: bundledExecURL)
+
+            // SwiftPM リソースバンドル (Mnemosift_MnemosiftApp.bundle) および AppIcon.icns / AppIcon.png をコピー
+            let resourceBundleName = "Mnemosift_MnemosiftApp.bundle"
+            let srcResourceBundle = buildDir.appendingPathComponent(resourceBundleName)
+            let dstResourceBundle = resourcesURL.appendingPathComponent(resourceBundleName)
+            if FileManager.default.fileExists(atPath: srcResourceBundle.path) {
+                try? FileManager.default.removeItem(at: dstResourceBundle)
+                try? FileManager.default.copyItem(at: srcResourceBundle, to: dstResourceBundle)
+            }
+
+            if let icnsSrc = Bundle.module.url(forResource: "AppIcon", withExtension: "icns") {
+                let icnsDst = resourcesURL.appendingPathComponent("AppIcon.icns")
+                try? FileManager.default.removeItem(at: icnsDst)
+                try? FileManager.default.copyItem(at: icnsSrc, to: icnsDst)
+            }
+            if let pngSrc = Bundle.module.url(forResource: "AppIcon", withExtension: "png") {
+                let pngDst = resourcesURL.appendingPathComponent("AppIcon.png")
+                try? FileManager.default.removeItem(at: pngDst)
+                try? FileManager.default.copyItem(at: pngSrc, to: pngDst)
+            }
 
             let infoPlistXML = """
             <?xml version="1.0" encoding="UTF-8"?>
@@ -116,6 +161,10 @@ struct MnemosiftApp: App {
                 <string>Mnemosift</string>
                 <key>CFBundleExecutable</key>
                 <string>Mnemosift</string>
+                <key>CFBundleIconFile</key>
+                <string>AppIcon</string>
+                <key>CFBundleIconName</key>
+                <string>AppIcon</string>
                 <key>CFBundlePackageType</key>
                 <string>APPL</string>
                 <key>CFBundleShortVersionString</key>
@@ -137,6 +186,10 @@ struct MnemosiftApp: App {
             """
             try infoPlistXML.write(to: infoPlistURL, atomically: true, encoding: .utf8)
 
+            if let iconImg = loadAppIconImage() {
+                NSWorkspace.shared.setIcon(iconImg, forFile: appBundleURL.path, options: [])
+            }
+
             // Ad-hoc 署名を適用して TCC が Info.plist を認識できるようにする
             let signProc = Process()
             signProc.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
@@ -146,7 +199,7 @@ struct MnemosiftApp: App {
             try signProc.run()
             signProc.waitUntilExit()
 
-            // LaunchServices 経由で Mnemosift.app を起動（TCC の責任プロセスを Mnemosift.app 自身にする）
+            // LaunchServices 経由で Mnemosift.app を起動
             let openProc = Process()
             openProc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
             openProc.arguments = ["-W", appBundleURL.path]
@@ -154,7 +207,6 @@ struct MnemosiftApp: App {
             openProc.waitUntilExit()
             Darwin.exit(openProc.terminationStatus)
         } catch {
-            // バンドル生成に失敗した場合でもクラッシュせずそのまま続行（LiveAudioStreamEngine 側のガードが保護）
             return
         }
     }
