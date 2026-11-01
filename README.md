@@ -57,19 +57,15 @@ swift run Mnemosift mcp
 swift test
 ```
 
-### 2. ローカルでのリリースパッケージング
+### 2. ワンコマンドでのリリース実行（ローカルビルド ＆ GitHub Release公開）
+ローカルの Mac でビルド・パッケージングを行い、タグ付けと GitHub Release へのアップロードまでを自動で一括実行します：
 ```bash
-# .build/Mnemosift.app のビルド
-./scripts/build_app.sh --configuration release
+# バージョン 0.1.0 をリリース
+./scripts/release_local.sh --version 0.1.0
 
-# dist/ 配下に .zip, .dmg, SHA256SUMS.txt を生成
-./scripts/package_release.sh --version 0.1.0
+# Apple 公証（Notarization）も同時に行う場合
+./scripts/release_local.sh --version 0.1.0 --notarize
 ```
-
-### 3. GitHub Actions による自動リリース
-バージョンタグを push すると、GitHub Actions (`.github/workflows/release.yml`) が自動的に macOS ランナー上でビルド＆パッケージングを行い、GitHub Release を公開します：
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-また、GitHub リポジトリの **Actions > Release Mnemosift > Run workflow** から手動でトリガーすることも可能です。
+- `dist/` 配下に `Mnemosift-vX.Y.Z.dmg`、`Mnemosift-macOS-arm64.zip`、`SHA256SUMS.txt` を自動生成。
+- `git tag vX.Y.Z` を自動作成してリモートへプッシュ。
+- GitHub CLI (`gh`) 認証済みの場合は自動で Release へアセットをアップロード。未認証の場合は Finder とブラウザの Release 作成画面を自動で開くため、ドラッグ＆ドロップで簡単に公開できます。
