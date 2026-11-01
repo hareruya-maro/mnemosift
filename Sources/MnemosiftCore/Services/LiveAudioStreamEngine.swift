@@ -30,9 +30,9 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
     private var currentProvisionalText: String = ""
     private var lastCommittedUtteranceText: String = ""
 
-    // タスク切り替え時の頭切れを防ぐプリロールバッファ（直近約0.6秒分）
+    // タスク切り替え時の頭切れを防ぐプリロールバッファ（直近約1.5秒分）
     private var preRollPCMChunks: [AVAudioPCMBuffer] = []
-    private let maxPreRollChunks = 8
+    private let maxPreRollChunks = 12
 
     // 共通オーディオフォーマット (16kHz モノラル Float32)
     private let commonAudioFormat: AVAudioFormat
@@ -256,7 +256,7 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
         let rmsLevel = Self.calculateRMSLevel(samples: samples16k)
         self.onLevelMeterUpdate?(rmsLevel)
 
-        if rmsLevel > 0.025 {
+        if rmsLevel > 0.026 {
             self.lastVoiceEnergyDetectedTime = Date()
             self.continuousVoiceFramesCount += 1
         } else {
@@ -414,7 +414,7 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
 
         // プリロールバッファがあれば新しいリクエストに流し込んで発話頭切れを防ぐ
         if replayPreRoll {
-            for chunk in self.preRollPCMChunks.suffix(4) {
+            for chunk in self.preRollPCMChunks.suffix(8) {
                 request.append(chunk)
             }
         }
@@ -447,33 +447,62 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
 
     private func handleUpdatedTranscriptionLocked(fullText: String, isFinal: Bool) {
         if fullText.count < self.committedCharCountInCurrentTask {
-            self.committedCharCountInCurrentTask = 0
+            self.committedCharCountInCurrentTask = min(self.committedCharCountInCurrentTask, fullText.count)
         }
 
         self.latestFullTaskTranscription = fullText
 
-        let uncommittedSlice: String
+        // 1. 現在の未確定文字列を抽出
+        var uncommittedSlice: String
         if self.committedCharCountInCurrentTask <= fullText.count {
             let startIdx = fullText.index(fullText.startIndex, offsetBy: self.committedCharCountInCurrentTask)
-            uncommittedSlice = String(fullText[startIdx...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            uncommittedSlice = String(fullText[startIdx...])
         } else {
             uncommittedSlice = ""
         }
 
-        if !uncommittedSlice.isEmpty && uncommittedSlice != self.currentProvisionalText {
+        // 2. 未確定テキストが一定長になり、文中に自然な分割点（「。」や文末表現）がある場合、先行する文をインライン確定コミット
+        while let splitIdx = Self.findNaturalSplitPoint(in: uncommittedSlice, minLength: 24, maxLength: 65) {
+            let rawSentence = String(uncommittedSlice[..<splitIdx])
+            let sentenceToCommit = rawSentence.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !sentenceToCommit.isEmpty else { break }
+
+            let consumedCharCount = uncommittedSlice.distance(from: uncommittedSlice.startIndex, to: splitIdx)
+            self.committedCharCountInCurrentTask = min(fullText.count, self.committedCharCountInCurrentTask + consumedCharCount)
+
+            let formattedSentence = Self.formatJapanesePunctuation(sentenceToCommit)
+            if formattedSentence != self.lastCommittedUtteranceText {
+                self.lastCommittedUtteranceText = formattedSentence
+                let nowSeconds = Date().timeIntervalSince(self.sessionStartTime)
+                let startSec = self.currentUtteranceStartSeconds
+                let endSec = max(startSec + 0.8, nowSeconds)
+                self.currentUtteranceStartSeconds = endSec
+                self.onFinalizedUtterance?(formattedSentence, startSec, endSec)
+            }
+
+            uncommittedSlice = String(uncommittedSlice[splitIdx...])
+            self.currentUtteranceStartSeconds = Date().timeIntervalSince(self.sessionStartTime)
+        }
+
+        // 3. 残りの未確定スライスを暫定テキストとして画面に反映
+        let trimmedProvisional = uncommittedSlice.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedProvisional.isEmpty && trimmedProvisional != self.currentProvisionalText {
             if self.currentProvisionalText.isEmpty {
                 self.currentUtteranceStartSeconds = Date().timeIntervalSince(self.sessionStartTime)
             }
             self.lastSpokenTime = Date()
-            self.currentProvisionalText = uncommittedSlice
-            let formattedProvisional = Self.formatJapanesePunctuation(uncommittedSlice)
+            self.currentProvisionalText = trimmedProvisional
+            let formattedProvisional = Self.formatJapanesePunctuation(trimmedProvisional)
             self.onProvisionalTextUpdate?(formattedProvisional)
+        } else if trimmedProvisional.isEmpty && !self.currentProvisionalText.isEmpty {
+            self.currentProvisionalText = ""
+            self.onProvisionalTextUpdate?("")
         }
 
-        // Apple 側が1セッション終了 (isFinal) を返した場合、確定させてから即座に新タスクを起動
+        // Apple 側が1セッション終了 (isFinal) を返した場合、確定させてから即座に新タスクをプリロール付きで起動
         if isFinal {
             self.commitPendingUtteranceSliceLocked()
-            try? self.startNewSpeechRecognitionTaskLocked(replayPreRoll: false)
+            try? self.startNewSpeechRecognitionTaskLocked(replayPreRoll: true)
         }
     }
 
@@ -481,35 +510,61 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
         stopSilenceWatchdogLocked()
 
         let timer = DispatchSource.makeTimerSource(queue: stateQueue)
-        timer.schedule(deadline: .now() + .milliseconds(400), repeating: .milliseconds(350))
+        timer.schedule(deadline: .now() + .milliseconds(250), repeating: .milliseconds(200))
         timer.setEventHandler { [weak self] in
             guard let self, self.isRunningInternal else { return }
 
             let now = Date()
-            let silenceDuration = now.timeIntervalSince(self.lastSpokenTime)
+            let timeSinceLastSpoken = now.timeIntervalSince(self.lastSpokenTime)
+            let timeSinceLastVoice = now.timeIntervalSince(self.lastVoiceEnergyDetectedTime)
+            let isVoiceActive = timeSinceLastVoice < 0.45
 
             if !self.currentProvisionalText.isEmpty {
-                // 1. 無音が 1.2秒 続いた場合、または1セグメントが 110文字 に達した場合：
-                //    現在の発話を確定コミットし、クリーンに新しい認識タスクへローテーションして次の発話を待ち受ける
-                if silenceDuration >= 1.2 || self.currentProvisionalText.count >= 110 {
+                let hasEnding = Self.hasSentenceEnding(self.currentProvisionalText)
+                let hasContinuation = Self.hasContinuationEnding(self.currentProvisionalText)
+                let textLength = self.currentProvisionalText.count
+
+                // 確定条件:
+                // 1. 文末表現（〜です、〜ます、句点等）がある場合: テキスト更新が 0.45秒 止まったら即座に確定
+                let isSentenceFinished = hasEnding && timeSinceLastSpoken >= 0.45
+
+                // 2. 接続助詞（〜ですが、〜ので等）の場合: 息継ぎ待ちとして 1.3秒 待機
+                let isContinuationPause = hasContinuation && !isVoiceActive && timeSinceLastSpoken >= 1.3
+
+                // 3. 通常の途中語句の場合: テキスト更新停止 0.8秒 で確定
+                let isNormalPause = !hasEnding && !hasContinuation && timeSinceLastSpoken >= 0.8 && !isVoiceActive
+
+                // 4. 文字数が多くなった場合（50文字以上）: テキスト更新停止 0.35秒 で確定
+                let isLongTextBreak = textLength >= 50 && timeSinceLastSpoken >= 0.35
+
+                // 5. セーフティ上限（80文字以上）: 0.25秒止まったら即座に分割確定
+                let isSafetyLimit = textLength >= 80 && timeSinceLastSpoken >= 0.25
+
+                if isSentenceFinished || isContinuationPause || isNormalPause || isLongTextBreak || isSafetyLimit {
+                    // 発話を確定コミット（タスクは再起動せず継続）
                     self.commitPendingUtteranceSliceLocked()
-                    try? self.startNewSpeechRecognitionTaskLocked(replayPreRoll: false)
+
+                    // アイドル時の定期タスクローテーション
+                    let taskAge = now.timeIntervalSince(self.taskStartTime)
+                    if taskAge >= 40.0 || self.latestFullTaskTranscription.count >= 250 {
+                        try? self.startNewSpeechRecognitionTaskLocked(replayPreRoll: true)
+                    }
                 }
             } else if Self.canSafelyUseSpeechRecognizerTCC {
-                // 2. 未確定テキストが空の状態で、タスクが終了している／50秒経過した／
-                //    または「音声エネルギーが継続して入っているのに3.5秒以上認識結果が返ってこない（セッション詰まり）」場合：
-                //    自動的に新しい認識タスクを再起動して、明示的に停止されるまで永久に文字起こしを継続する
+                // 未確定テキストが空のアイドル状態
                 let taskState = self.recognitionTask?.state
                 let taskAge = now.timeIntervalSince(self.taskStartTime)
                 let timeSinceLastResult = now.timeIntervalSince(self.lastResultReceivedTime)
-                let hasRecentVoice = now.timeIntervalSince(self.lastVoiceEnergyDetectedTime) < 0.8 && self.continuousVoiceFramesCount >= 6
+                let hasRecentVoice = timeSinceLastVoice < 0.6 && self.continuousVoiceFramesCount >= 6
 
                 if self.recognitionRequest == nil || taskState == .completed || taskState == .canceling {
                     try? self.startNewSpeechRecognitionTaskLocked(replayPreRoll: true)
                 } else if hasRecentVoice && timeSinceLastResult >= 3.5 && taskAge >= 3.5 {
+                    // 音声が継続しているのに認識結果が返ってこないセッション詰まりの救済
                     try? self.startNewSpeechRecognitionTaskLocked(replayPreRoll: true)
-                } else if taskAge >= 50.0 {
-                    try? self.startNewSpeechRecognitionTaskLocked(replayPreRoll: false)
+                } else if taskAge >= 45.0 && !isVoiceActive && timeSinceLastVoice >= 1.0 {
+                    // 45秒経過かつ直近1.0秒以上完全無音なら、誰も話していないアイドル時に安全に新タスクへローテーション
+                    try? self.startNewSpeechRecognitionTaskLocked(replayPreRoll: true)
                 }
             }
         }
@@ -544,6 +599,107 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
         self.onFinalizedUtterance?(formattedText, startSec, endSec)
     }
 
+    // MARK: - 日本語文末・接続助詞判定と適応型無音閾値・インライン分割
+
+    public static let commonSentenceEndings: [String] = [
+        "ようこそ", "ございます", "ございました", "お願いします", "いたしました",
+        "いきましょう", "きましょう", "ご覧ください", "確認ください", "試しください",
+        "お届けしています", "お届けします", "紹介しています", "解説します",
+        "でしょうか", "ますでしょうか", "ました", "でした", "ません",
+        "思います", "思われます", "おります", "なります", "なっています", "なっております",
+        "ものです", "ことです", "わけです", "がちです",
+        "ます", "です", "しょう", "さい"
+    ]
+
+    public static let commonContinuationParticles: [String] = [
+        "が", "けど", "けれど", "ので", "から", "し", "と", "て", "で",
+        "たり", "ながら", "けれども", "ものの", "ところで", "あと", "また", "ね", "よ", "な", "か"
+    ]
+
+    /// 与えられたテキスト内で、自然に分割可能な位置（文末表現、句点「。」、または長文時の読点「、」・助詞）を探索する
+    public static func findNaturalSplitPoint(in text: String, minLength: Int = 24, maxLength: Int = 65) -> String.Index? {
+        guard text.count >= minLength else { return nil }
+
+        let minIdx = text.index(text.startIndex, offsetBy: minLength)
+
+        // 1. 最優先: minLength 以降にある句点「。」の直後
+        if let dotRange = text[minIdx...].range(of: "。") {
+            let afterDot = dotRange.upperBound
+            if text.distance(from: afterDot, to: text.endIndex) >= 4 {
+                return afterDot
+            }
+        }
+
+        // 2. 文末表現（〜ます、〜です、〜でした、〜思います など）の直後
+        let searchEnd = text.count > maxLength ? text.index(text.startIndex, offsetBy: maxLength) : text.endIndex
+        if minIdx < searchEnd {
+            let searchSub = text[minIdx..<searchEnd]
+            for ending in commonSentenceEndings {
+                if let range = searchSub.range(of: ending) {
+                    var splitIdx = range.upperBound
+                    if splitIdx < text.endIndex {
+                        let nextChar = text[splitIdx]
+                        if nextChar == "。" || nextChar == "、" || nextChar == " " {
+                            splitIdx = text.index(after: splitIdx)
+                        }
+                    }
+                    if text.distance(from: splitIdx, to: text.endIndex) >= 4 {
+                        return splitIdx
+                    }
+                }
+            }
+        }
+
+        // 3. maxLength（65文字程度）を超えている場合、読点「、」や助詞の切れ目でも分割
+        if text.count >= maxLength {
+            if let commaRange = text[minIdx...].range(of: "、") {
+                let afterComma = commaRange.upperBound
+                if text.distance(from: afterComma, to: text.endIndex) >= 4 {
+                    return afterComma
+                }
+            }
+            let splitParticles = ["ですが", "だけど", "けれど", "ので", "から", "また", "そして", "が", "けど", "し", "て", "で"]
+            for part in splitParticles {
+                if let range = text[minIdx...].range(of: part) {
+                    let afterPart = range.upperBound
+                    if text.distance(from: afterPart, to: text.endIndex) >= 4 {
+                        return afterPart
+                    }
+                }
+            }
+        }
+
+        return nil
+    }
+
+    /// 発話末尾が一文の完結（文末）を示しているかどうかを判定
+    public static func hasSentenceEnding(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if trimmed.hasSuffix("。") || trimmed.hasSuffix("？") || trimmed.hasSuffix("！") {
+            return true
+        }
+        return commonSentenceEndings.contains { trimmed.hasSuffix($0) }
+    }
+
+    /// 発話末尾が接続助詞などで「文がまだ継続している」可能性が高いかどうかを判定
+    public static func hasContinuationEnding(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        return commonContinuationParticles.contains { trimmed.hasSuffix($0) }
+    }
+
+    /// テキストの文脈に応じて、自然な息継ぎや言い淀みによる途中分断を防ぐ適応型無音待機時間（秒）を算出
+    private func adaptiveSilenceThreshold(for text: String) -> Double {
+        if Self.hasSentenceEnding(text) {
+            return 0.45
+        } else if Self.hasContinuationEnding(text) {
+            return 1.3
+        } else {
+            return 0.8
+        }
+    }
+
     /// 句読点のない連続音声認識テキストに自然な句読点（。・、）を補完する
     public static func formatJapanesePunctuation(_ text: String) -> String {
         var result = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -553,15 +709,8 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
             return result
         }
 
-        let sentenceEndings = [
-            "ようこそ", "ございます", "ございました", "お願いします", "いたしました",
-            "いきましょう", "きましょう", "ご覧ください", "確認ください", "試しください",
-            "お届けしています", "お届けします", "紹介しています", "解説します",
-            "でしょうか", "ますでしょうか", "ました", "でした", "ません",
-            "ます", "です", "しょう", "さい"
-        ]
-
-        let continuationParticles: [String] = ["が", "けど", "けれど", "ので", "から", "し", "と", "ね", "よ", "な", "か", "ね。"]
+        let sentenceEndings = commonSentenceEndings
+        let continuationParticles = commonContinuationParticles
 
         for ending in sentenceEndings {
             var searchRange = result.startIndex..<result.endIndex

@@ -215,19 +215,6 @@ public struct RecordingTranscriptionView: View {
 
             liveUtteranceSimulatorBar
 
-            if let provisional = workspace.sttService.currentProvisionalSegment {
-                HStack {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text("[暫定認識中] \(provisional.speakerLabel): \(provisional.rawText)")
-                        .font(.callout.italic())
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                }
-                .padding(10)
-                .background(.yellow.opacity(0.15), in: RoundedRectangle(cornerRadius: 8))
-            }
-
             segmentsListView
         }
         .padding(20)
@@ -295,13 +282,53 @@ public struct RecordingTranscriptionView: View {
 
     private var segmentsListView: some View {
         let segments = currentTranscript.map { workspace.sttService.segments(for: $0.id) } ?? []
-        return ScrollView {
-            LazyVStack(alignment: .leading, spacing: 12) {
-                ForEach(segments) { segment in
-                    segmentCard(segment)
+        let provisional = workspace.sttService.currentProvisionalSegment
+        return ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    ForEach(segments) { segment in
+                        segmentCard(segment)
+                            .id(segment.id)
+                    }
+
+                    if let provisional {
+                        provisionalCard(provisional)
+                            .id("provisional-bottom")
+                    }
                 }
             }
+            .onChange(of: segments.count) {
+                scrollToBottom(proxy: proxy, segments: segments, provisional: provisional)
+            }
+            .onChange(of: workspace.sttService.currentProvisionalSegment?.rawText) {
+                scrollToBottom(proxy: proxy, segments: segments, provisional: provisional)
+            }
         }
+    }
+
+    private func scrollToBottom(proxy: ScrollViewProxy, segments: [TranscriptSegment], provisional: TranscriptSegment?) {
+        if provisional != nil {
+            withAnimation {
+                proxy.scrollTo("provisional-bottom", anchor: .bottom)
+            }
+        } else if let lastSegment = segments.last {
+            withAnimation {
+                proxy.scrollTo(lastSegment.id, anchor: .bottom)
+            }
+        }
+    }
+
+    private func provisionalCard(_ provisional: TranscriptSegment) -> some View {
+        HStack {
+            ProgressView()
+                .controlSize(.small)
+            Text("[暫定認識中] \(provisional.speakerLabel): \(provisional.rawText)")
+                .font(.callout.italic())
+                .foregroundStyle(.secondary)
+            Spacer()
+        }
+        .padding(10)
+        .background(.yellow.opacity(0.15), in: RoundedRectangle(cornerRadius: 8))
     }
 
     private func segmentCard(_ segment: TranscriptSegment) -> some View {

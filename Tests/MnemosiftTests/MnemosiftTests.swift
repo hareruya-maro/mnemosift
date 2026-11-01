@@ -540,6 +540,23 @@ struct MnemosiftTests {
         let formattedSample = LiveAudioStreamEngine.formatJapanesePunctuation(youtubeSample)
         #expect(formattedSample.contains("。"))
 
+        // 文末判定および接続助詞判定（適応型無音確定制御）の検証
+        #expect(LiveAudioStreamEngine.hasSentenceEnding("本日の議題について説明いたします"))
+        #expect(LiveAudioStreamEngine.hasSentenceEnding("売上状況はどうでしょうか？"))
+        #expect(!LiveAudioStreamEngine.hasSentenceEnding("本日の議題についてですが"))
+        #expect(LiveAudioStreamEngine.hasContinuationEnding("本日の議題についてですが"))
+        #expect(LiveAudioStreamEngine.hasContinuationEnding("時間が押している状況なので"))
+        #expect(!LiveAudioStreamEngine.hasContinuationEnding("説明を終わります。"))
+
+        // 長文インライン分割（findNaturalSplitPoint）の検証
+        let longUtteranceStream = "商品レビューの分類というのをやってみようと思います。ローカルLDムなどが動かせるおラマのツールを使った受験になります。"
+        let splitIdx = LiveAudioStreamEngine.findNaturalSplitPoint(in: longUtteranceStream, minLength: 15, maxLength: 60)
+        #expect(splitIdx != nil)
+        if let splitIdx {
+            let firstSentence = String(longUtteranceStream[..<splitIdx])
+            #expect(firstSentence.contains("思います。"))
+        }
+
         ws.recordingService.onFinalizedUtterance?(formattedSample, 0.0, 27.0)
         // 同一内容が重複して飛んできた場合でも1件に抑えられることを検証
         ws.recordingService.onFinalizedUtterance?(formattedSample, 27.0, 28.0)

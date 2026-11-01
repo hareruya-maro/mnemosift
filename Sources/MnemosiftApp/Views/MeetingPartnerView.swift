@@ -314,35 +314,58 @@ public struct MeetingPartnerView: View {
 
     private var liveTranscriptStreamView: some View {
         let segments = currentTranscript.map { workspace.sttService.segments(for: $0.id) } ?? []
-        return ScrollView {
-            LazyVStack(alignment: .leading, spacing: 10) {
-                if let provisional = workspace.sttService.currentProvisionalSegment {
-                    HStack(spacing: 8) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("[\(provisional.speakerLabel)] \(provisional.rawText)")
-                            .font(.callout.italic())
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(10)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.yellow.opacity(0.14), in: RoundedRectangle(cornerRadius: 8))
-                }
+        let provisional = workspace.sttService.currentProvisionalSegment
+        return ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    if segments.isEmpty && provisional == nil {
+                        ContentUnavailableView(
+                            "発話がまだありません",
+                            systemImage: "waveform.and.mic",
+                            description: Text("「録音開始」または下のテスト発話バーから発言を追加すると、右側にリアルタイム要約と関連資料が自動提案されます。")
+                        )
+                        .padding(.top, 40)
+                    } else {
+                        ForEach(segments) { segment in
+                            transcriptUtteranceBubble(segment)
+                                .id(segment.id)
+                        }
 
-                if segments.isEmpty {
-                    ContentUnavailableView(
-                        "発話がまだありません",
-                        systemImage: "waveform.and.mic",
-                        description: Text("「録音開始」または下のテスト発話バーから発言を追加すると、右側にリアルタイム要約と関連資料が自動提案されます。")
-                    )
-                    .padding(.top, 40)
-                } else {
-                    ForEach(segments) { segment in
-                        transcriptUtteranceBubble(segment)
+                        if let provisional {
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("[\(provisional.speakerLabel)] \(provisional.rawText)")
+                                    .font(.callout.italic())
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(.yellow.opacity(0.14), in: RoundedRectangle(cornerRadius: 8))
+                            .id("provisional-stream-bottom")
+                        }
                     }
                 }
+                .padding(.vertical, 4)
             }
-            .padding(.vertical, 4)
+            .onChange(of: segments.count) {
+                scrollToStreamBottom(proxy: proxy, segments: segments, provisional: provisional)
+            }
+            .onChange(of: workspace.sttService.currentProvisionalSegment?.rawText) {
+                scrollToStreamBottom(proxy: proxy, segments: segments, provisional: provisional)
+            }
+        }
+    }
+
+    private func scrollToStreamBottom(proxy: ScrollViewProxy, segments: [TranscriptSegment], provisional: TranscriptSegment?) {
+        if provisional != nil {
+            withAnimation {
+                proxy.scrollTo("provisional-stream-bottom", anchor: .bottom)
+            }
+        } else if let lastSegment = segments.last {
+            withAnimation {
+                proxy.scrollTo(lastSegment.id, anchor: .bottom)
+            }
         }
     }
 
