@@ -72,7 +72,7 @@ struct MnemosiftApp: App {
     var body: some Scene {
         WindowGroup("Mnemosift — 会議のAIパートナー & ローカルナレッジ") {
             MainWorkspaceView(workspace: workspace)
-                .frame(minWidth: 1120, minHeight: 740)
+                .frame(minWidth: 800, minHeight: 540)
                 .sheet(isPresented: $updateService.isShowingUpdateSheet) {
                     UpdateSheetView()
                 }

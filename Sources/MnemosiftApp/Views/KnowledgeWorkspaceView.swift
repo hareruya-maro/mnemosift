@@ -55,12 +55,13 @@ public struct KnowledgeWorkspaceView: View {
 
             HSplitView {
                 leftKnowledgeListColumn
-                    .frame(minWidth: 380, idealWidth: 440, maxWidth: 520, maxHeight: .infinity)
+                    .frame(minWidth: 320, idealWidth: 420, maxWidth: 520, maxHeight: .infinity)
 
                 rightDetailAndRAGChatColumn
-                    .frame(minWidth: 460, idealWidth: 580, maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(minWidth: 340, idealWidth: 540, maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
             handleFileDrop(providers)
         }
@@ -70,96 +71,30 @@ public struct KnowledgeWorkspaceView: View {
 
     private var topSearchAndFilterBar: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 12) {
-                HStack {
-                    Image(systemName: "magnifyingglass")
-                        .foregroundStyle(.secondary)
-                    TextField("資料・議事録・発言キーワードや自然言語で検索...", text: $searchQuery)
-                        .textFieldStyle(.plain)
-                        .onSubmit {
-                            runHybridSearch()
-                        }
-                    if !searchQuery.isEmpty {
-                        Button("クリア", systemImage: "xmark.circle.fill") {
-                            searchQuery = ""
-                        }
-                        .labelStyle(.iconOnly)
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.secondary)
+            ViewThatFits(in: .horizontal) {
+                // 十分な幅がある場合: 1行で並べる
+                HStack(spacing: 10) {
+                    searchBarInputField
+                    searchScopePickerView
+                    searchModePickerView
+                    searchExecuteButtonView
+                    Spacer(minLength: 4)
+                    knowledgeActionButtonsView
+                }
+
+                // 狭い場合: 2行に折り返す
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        searchBarInputField
+                        searchExecuteButtonView
+                        Spacer(minLength: 4)
+                        knowledgeActionButtonsView
                     }
-                }
-                .padding(8)
-                .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
-
-                Picker("範囲", selection: $searchScope) {
-                    ForEach(SearchScopeMode.allCases) { mode in
-                        Text(mode.displayName).tag(mode)
+                    HStack(spacing: 8) {
+                        searchScopePickerView
+                        searchModePickerView
+                        Spacer()
                     }
-                }
-                .controlSize(.small)
-                .frame(width: 185)
-                .onChange(of: searchScope) {
-                    if !searchQuery.isEmpty { runHybridSearch() }
-                }
-
-                Picker(
-                    "方式",
-                    selection: Binding(
-                        get: { workspace.searchService.selectedHybridMode },
-                        set: { workspace.searchService.selectedHybridMode = $0 }
-                    )
-                ) {
-                    ForEach(HybridSearchExecutionMode.allCases) { hMode in
-                        Text(hMode.displayName).tag(hMode)
-                    }
-                }
-                .controlSize(.small)
-                .frame(width: 245)
-                .onChange(of: workspace.searchService.selectedHybridMode) {
-                    if !searchQuery.isEmpty { runHybridSearch() }
-                }
-
-                Button("検索", systemImage: "sparkle.magnifyingglass") {
-                    runHybridSearch()
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-
-                Spacer()
-
-                Button("インデックス再生成", systemImage: "arrow.triangle.2.circlepath") {
-                    if let count = try? workspace.searchService.regenerateAllSearchIndexes() {
-                        workspace.statusBannerMessage = "✅ 2階層ハイブリッド検索インデックスを再生成しました（\(count)件）"
-                    }
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-
-                Button("📁 フォルダ一括読込", systemImage: "folder.badge.plus") {
-                    isShowingFolderImportPopover = true
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .popover(isPresented: $isShowingFolderImportPopover) {
-                    folderBulkImportPopoverContent
-                }
-
-                Button("＋ 資料を追加", systemImage: "doc.badge.plus") {
-                    isShowingAddDocumentPopover = true
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .popover(isPresented: $isShowingAddDocumentPopover) {
-                    addDocumentPopoverContent
-                }
-
-                Button("＋ 用語登録", systemImage: "character.book.closed") {
-                    isShowingAddVocabPopover = true
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .popover(isPresented: $isShowingAddVocabPopover) {
-                    addVocabularyPopoverContent
                 }
             }
 
@@ -205,6 +140,108 @@ public struct KnowledgeWorkspaceView: View {
         .padding(.horizontal, 18)
         .padding(.vertical, 12)
         .background(.regularMaterial)
+    }
+
+    private var searchBarInputField: some View {
+        HStack {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("資料・議事録・発言キーワードや自然言語で検索...", text: $searchQuery)
+                .textFieldStyle(.plain)
+                .frame(minWidth: 120)
+                .onSubmit {
+                    runHybridSearch()
+                }
+            if !searchQuery.isEmpty {
+                Button("クリア", systemImage: "xmark.circle.fill") {
+                    searchQuery = ""
+                }
+                .labelStyle(.iconOnly)
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .padding(8)
+        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var searchScopePickerView: some View {
+        Picker("範囲", selection: $searchScope) {
+            ForEach(SearchScopeMode.allCases) { mode in
+                Text(mode.displayName).tag(mode)
+            }
+        }
+        .controlSize(.small)
+        .frame(minWidth: 120, maxWidth: 175)
+        .onChange(of: searchScope) {
+            if !searchQuery.isEmpty { runHybridSearch() }
+        }
+    }
+
+    private var searchModePickerView: some View {
+        Picker(
+            "方式",
+            selection: Binding(
+                get: { workspace.searchService.selectedHybridMode },
+                set: { workspace.searchService.selectedHybridMode = $0 }
+            )
+        ) {
+            ForEach(HybridSearchExecutionMode.allCases) { hMode in
+                Text(hMode.displayName).tag(hMode)
+            }
+        }
+        .controlSize(.small)
+        .frame(minWidth: 150, maxWidth: 220)
+        .onChange(of: workspace.searchService.selectedHybridMode) {
+            if !searchQuery.isEmpty { runHybridSearch() }
+        }
+    }
+
+    private var searchExecuteButtonView: some View {
+        Button("検索", systemImage: "sparkle.magnifyingglass") {
+            runHybridSearch()
+        }
+        .buttonStyle(.borderedProminent)
+        .controlSize(.small)
+    }
+
+    private var knowledgeActionButtonsView: some View {
+        HStack(spacing: 6) {
+            Button("インデックス再生成", systemImage: "arrow.triangle.2.circlepath") {
+                if let count = try? workspace.searchService.regenerateAllSearchIndexes() {
+                    workspace.statusBannerMessage = "✅ 2階層ハイブリッド検索インデックスを再生成しました（\(count)件）"
+                }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            Button("📁 フォルダ一括読込", systemImage: "folder.badge.plus") {
+                isShowingFolderImportPopover = true
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .popover(isPresented: $isShowingFolderImportPopover) {
+                folderBulkImportPopoverContent
+            }
+
+            Button("＋ 資料を追加", systemImage: "doc.badge.plus") {
+                isShowingAddDocumentPopover = true
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .popover(isPresented: $isShowingAddDocumentPopover) {
+                addDocumentPopoverContent
+            }
+
+            Button("＋ 用語登録", systemImage: "character.book.closed") {
+                isShowingAddVocabPopover = true
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .popover(isPresented: $isShowingAddVocabPopover) {
+                addVocabularyPopoverContent
+            }
+        }
     }
 
     // MARK: - Left Column: Filtered List or Hybrid Search Results

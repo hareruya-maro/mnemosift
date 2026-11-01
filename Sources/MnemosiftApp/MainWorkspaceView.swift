@@ -15,8 +15,9 @@ public struct MainWorkspaceView: View {
     }
 
     public var body: some View {
-        VStack(spacing: 0) {
+        VStack(alignment: .leading, spacing: 0) {
             topUnifiedHeaderBar
+                .frame(maxWidth: .infinity)
             Divider()
 
             // 資料検索モード閲覧中に録音が行われている場合は、上部にコンパクトな録音ステータスバーを常時表示
@@ -65,25 +66,28 @@ public struct MainWorkspaceView: View {
             switch workspace.activeMode {
             case .meetingPartner:
                 MeetingPartnerView(workspace: workspace)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             case .knowledgeHub:
                 KnowledgeWorkspaceView(workspace: workspace)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .sheet(isPresented: $workspace.isShowingSettingsSheet) {
             SettingsAndToolsSheet(workspace: workspace)
         }
     }
 
     private var topUnifiedHeaderBar: some View {
-        HStack(spacing: 16) {
+        HStack(spacing: 12) {
             // 左側: アプリアイコン・名前 ＋ プロジェクト文脈切替フィルタ
-            HStack(spacing: 10) {
-                HStack(spacing: 8) {
+            HStack(spacing: 8) {
+                HStack(spacing: 6) {
                     if let appIcon = MnemosiftApp.loadAppIconImage() {
                         Image(nsImage: appIcon)
                             .resizable()
                             .interpolation(.high)
-                            .frame(width: 24, height: 24)
+                            .frame(width: 22, height: 22)
                     } else {
                         Circle()
                             .fill(.green)
@@ -104,7 +108,7 @@ public struct MainWorkspaceView: View {
                 }
                 .labelsHidden()
                 .controlSize(.small)
-                .frame(width: 220)
+                .frame(minWidth: 140, maxWidth: 220)
                 .onChange(of: workspace.selectedProjectId) {
                     workspace.refreshMeetingPartnerState()
                 }
@@ -120,7 +124,7 @@ public struct MainWorkspaceView: View {
                 }
             }
 
-            Spacer()
+            Spacer(minLength: 6)
 
             // 中央: メインの2モード切替タブ（🎙️ 会議パートナー ⇄ 📚 資料検索・整理）
             Picker("ワークスペースモード", selection: $workspace.activeMode) {
@@ -131,18 +135,20 @@ public struct MainWorkspaceView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(width: 340)
+            .frame(minWidth: 260, maxWidth: 320)
 
-            Spacer()
+            Spacer(minLength: 6)
 
             // 右側: 現在のAI構成バッジ ＆ 設定・外部LLM連携ボタン
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 let activeProject = workspace.projectService.project(for: workspace.selectedProjectId)
                 let resolved = workspace.modelManager.resolveConfiguration(project: activeProject)
 
                 Text("\(resolved.realtimeSTTModel.name) + \(resolved.llmModel.name)")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
                     .background(.secondary.opacity(0.1), in: Capsule())
@@ -154,8 +160,8 @@ public struct MainWorkspaceView: View {
                 .buttonStyle(.bordered)
             }
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
         .background(.bar)
     }
 

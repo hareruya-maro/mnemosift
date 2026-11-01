@@ -41,12 +41,13 @@ public struct MeetingPartnerView: View {
             // メインの2カラム集中型スプリットビュー
             HSplitView {
                 leftTranscriptionAndMinutesColumn
-                    .frame(minWidth: 460, idealWidth: 560, maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(minWidth: 320, idealWidth: 540, maxWidth: .infinity, maxHeight: .infinity)
 
                 rightPartnerCopilotColumn
-                    .frame(minWidth: 420, idealWidth: 500, maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(minWidth: 300, idealWidth: 480, maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onAppear {
             let activeProject = workspace.projectService.project(for: workspace.selectedProjectId)
             let resolved = workspace.modelManager.resolveConfiguration(project: activeProject)
@@ -115,37 +116,24 @@ public struct MeetingPartnerView: View {
         VStack(alignment: .leading, spacing: 12) {
             recordingCompactHeaderBar
 
-            HStack {
-                Picker("表示モード", selection: $leftTab) {
-                    ForEach(LeftColumnTab.allCases) { tab in
-                        Text(tab.rawValue).tag(tab)
-                    }
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    leftModeSegmentedPicker
+                        .frame(minWidth: 240, maxWidth: 320)
+
+                    Spacer(minLength: 8)
+
+                    leftTabActionButtons
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 340)
 
-                Spacer()
+                VStack(alignment: .leading, spacing: 8) {
+                    leftModeSegmentedPicker
+                        .frame(maxWidth: .infinity)
 
-                if leftTab == .liveTranscript {
-                    Toggle("STT原文との比較を表示", isOn: $showRawDiffInline)
-                        .toggleStyle(.switch)
-                        .controlSize(.small)
-                        .font(.caption)
-                } else if let meeting = currentMeeting {
-                    Button("コピー", systemImage: "doc.on.doc") {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(editableMinutesMarkdown, forType: .string)
-                        workspace.statusBannerMessage = "議事録Markdownをコピーしました"
+                    HStack {
+                        Spacer()
+                        leftTabActionButtons
                     }
-                    .controlSize(.small)
-
-                    Button("Markdown保存", systemImage: "square.and.arrow.up") {
-                        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(meeting.title).md")
-                        try? workspace.llmService.exportMeetingToMarkdownFile(meeting: meeting, destinationURL: url)
-                        workspace.statusBannerMessage = "書き出し完了: \(url.path)"
-                    }
-                    .controlSize(.small)
                 }
             }
 
@@ -159,9 +147,43 @@ public struct MeetingPartnerView: View {
         .padding(16)
     }
 
+    private var leftModeSegmentedPicker: some View {
+        Picker("表示モード", selection: $leftTab) {
+            ForEach(LeftColumnTab.allCases) { tab in
+                Text(tab.rawValue).tag(tab)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+    }
+
+    @ViewBuilder
+    private var leftTabActionButtons: some View {
+        if leftTab == .liveTranscript {
+            Toggle("STT原文との比較を表示", isOn: $showRawDiffInline)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .font(.caption)
+        } else if let meeting = currentMeeting {
+            Button("コピー", systemImage: "doc.on.doc") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(editableMinutesMarkdown, forType: .string)
+                workspace.statusBannerMessage = "議事録Markdownをコピーしました"
+            }
+            .controlSize(.small)
+
+            Button("Markdown保存", systemImage: "square.and.arrow.up") {
+                let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(meeting.title).md")
+                try? workspace.llmService.exportMeetingToMarkdownFile(meeting: meeting, destinationURL: url)
+                workspace.statusBannerMessage = "書き出し完了: \(url.path)"
+            }
+            .controlSize(.small)
+        }
+    }
+
     private var recordingCompactHeaderBar: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 Button {
                     withAnimation(.easeInOut(duration: 0.18)) {
                         workspace.isShowingPastSessionsDrawer.toggle()
@@ -179,13 +201,15 @@ public struct MeetingPartnerView: View {
                     Text(activeTr.title)
                         .font(.headline)
                         .lineLimit(1)
+                        .truncationMode(.tail)
+                        .layoutPriority(-1)
                 } else {
                     TextField("会議タイトルを入力...", text: $sessionTitleInput)
                         .textFieldStyle(.roundedBorder)
-                        .frame(maxWidth: 220)
+                        .frame(minWidth: 100, maxWidth: 220)
                 }
 
-                Spacer()
+                Spacer(minLength: 4)
 
                 // 録音ボタン群
                 if workspace.recordingService.state == .idle || workspace.recordingService.state == .completed {
@@ -231,63 +255,26 @@ public struct MeetingPartnerView: View {
                 }
             }
 
-            HStack(spacing: 10) {
-                Picker("音声入力", selection: $selectedAudioSource) {
-                    Text("マイク＋システム音声").tag(AudioSourceType.microphoneAndSystem)
-                    Text("マイクのみ").tag(AudioSourceType.microphone)
-                    Text("システム音声のみ").tag(AudioSourceType.systemAudio)
-                }
-                .controlSize(.small)
-                .frame(width: 195)
-
-                Picker("STTモデル", selection: Binding(
-                    get: { workspace.modelManager.globalSettings.realtimeSTTModelId },
-                    set: { newModelId in
-                        var s = workspace.modelManager.globalSettings
-                        s.realtimeSTTModelId = newModelId
-                        try? workspace.modelManager.updateGlobalSettings(s)
-                        if let model = workspace.modelManager.model(withId: newModelId) {
-                            workspace.recordingService.liveEngine.updateActiveSTTModel(model)
-                        }
-                    }
-                )) {
-                    ForEach(workspace.modelManager.models(for: .stt)) { model in
-                        let statusMark = model.downloadState == .installed ? "" : " [未DL]"
-                        Text("\(model.name)\(statusMark)").tag(model.id)
-                    }
-                }
-                .controlSize(.small)
-                .frame(width: 245)
-
-                if let selectedSTT = workspace.modelManager.model(withId: workspace.modelManager.globalSettings.realtimeSTTModelId),
-                   selectedSTT.downloadState == .notInstalled {
-                    Button("DL", systemImage: "arrow.down.circle.fill") {
-                        workspace.modelManager.startModelDownloadTask(id: selectedSTT.id)
-                    }
-                    .controlSize(.mini)
-                    .buttonStyle(.borderedProminent)
-                    .help("\(selectedSTT.name) をアプリ内にダウンロードします")
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    recordingSourcePickerView
+                    sttModelPickerView
+                    aiCorrectionPickerView
+                    Spacer(minLength: 4)
+                    waveformIndicatorView
                 }
 
-                Picker("AI補正", selection: $selectedCorrectionMode) {
-                    ForEach(RealtimeCorrectionMode.allCases) { mode in
-                        Text(mode.displayName).tag(mode)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        recordingSourcePickerView
+                        sttModelPickerView
+                    }
+                    HStack(spacing: 8) {
+                        aiCorrectionPickerView
+                        Spacer(minLength: 4)
+                        waveformIndicatorView
                     }
                 }
-                .controlSize(.small)
-                .frame(width: 195)
-
-                Spacer()
-
-                // ミニ波形インジケーター
-                HStack(alignment: .bottom, spacing: 2) {
-                    ForEach(Array(workspace.recordingService.waveformSamples.suffix(16).enumerated()), id: \.offset) { _, level in
-                        RoundedRectangle(cornerRadius: 1.5)
-                            .fill(workspace.recordingService.state == .recording ? .red : .secondary.opacity(0.3))
-                            .frame(width: 3, height: max(4, CGFloat(level) * 18))
-                    }
-                }
-                .frame(height: 20)
             }
 
             // システム音声（画面収録）権限チェックバナー
@@ -310,6 +297,70 @@ public struct MeetingPartnerView: View {
         }
         .padding(12)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var recordingSourcePickerView: some View {
+        Picker("音声入力", selection: $selectedAudioSource) {
+            Text("マイク＋システム音声").tag(AudioSourceType.microphoneAndSystem)
+            Text("マイクのみ").tag(AudioSourceType.microphone)
+            Text("システム音声のみ").tag(AudioSourceType.systemAudio)
+        }
+        .controlSize(.small)
+        .frame(minWidth: 120, maxWidth: 185)
+    }
+
+    private var sttModelPickerView: some View {
+        HStack(spacing: 4) {
+            Picker("STTモデル", selection: Binding(
+                get: { workspace.modelManager.globalSettings.realtimeSTTModelId },
+                set: { newModelId in
+                    var s = workspace.modelManager.globalSettings
+                    s.realtimeSTTModelId = newModelId
+                    try? workspace.modelManager.updateGlobalSettings(s)
+                    if let model = workspace.modelManager.model(withId: newModelId) {
+                        workspace.recordingService.liveEngine.updateActiveSTTModel(model)
+                    }
+                }
+            )) {
+                ForEach(workspace.modelManager.models(for: .stt)) { model in
+                    let statusMark = model.downloadState == .installed ? "" : " [未DL]"
+                    Text("\(model.name)\(statusMark)").tag(model.id)
+                }
+            }
+            .controlSize(.small)
+            .frame(minWidth: 140, maxWidth: 230)
+
+            if let selectedSTT = workspace.modelManager.model(withId: workspace.modelManager.globalSettings.realtimeSTTModelId),
+               selectedSTT.downloadState == .notInstalled {
+                Button("DL", systemImage: "arrow.down.circle.fill") {
+                    workspace.modelManager.startModelDownloadTask(id: selectedSTT.id)
+                }
+                .controlSize(.mini)
+                .buttonStyle(.borderedProminent)
+                .help("\(selectedSTT.name) をアプリ内にダウンロードします")
+            }
+        }
+    }
+
+    private var aiCorrectionPickerView: some View {
+        Picker("AI補正", selection: $selectedCorrectionMode) {
+            ForEach(RealtimeCorrectionMode.allCases) { mode in
+                Text(mode.displayName).tag(mode)
+            }
+        }
+        .controlSize(.small)
+        .frame(minWidth: 120, maxWidth: 185)
+    }
+
+    private var waveformIndicatorView: some View {
+        HStack(alignment: .bottom, spacing: 2) {
+            ForEach(Array(workspace.recordingService.waveformSamples.suffix(16).enumerated()), id: \.offset) { _, level in
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(workspace.recordingService.state == .recording ? .red : .secondary.opacity(0.3))
+                    .frame(width: 3, height: max(4, CGFloat(level) * 18))
+            }
+        }
+        .frame(height: 20)
     }
 
     private var liveTranscriptStreamView: some View {
@@ -425,12 +476,13 @@ public struct MeetingPartnerView: View {
         HStack(spacing: 8) {
             TextField("話者", text: $speakerInput)
                 .textFieldStyle(.roundedBorder)
-                .frame(width: 72)
+                .frame(width: 52)
                 .controlSize(.small)
 
-            TextField("発話をシミュレート入力（リアルタイム要約・資料提案の動作確認用）...", text: $simulatedUtteranceInput)
+            TextField("発話をシミュレート入力...", text: $simulatedUtteranceInput)
                 .textFieldStyle(.roundedBorder)
                 .controlSize(.small)
+                .frame(minWidth: 80)
                 .onSubmit {
                     appendRealtimeUtterance()
                 }
@@ -441,36 +493,44 @@ public struct MeetingPartnerView: View {
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
         }
-        .padding(10)
+        .padding(8)
         .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10))
     }
 
     private var inlineMinutesEditorView: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Picker("議事録テンプレート", selection: $selectedTemplateId) {
-                    ForEach(workspace.llmService.templates) { tmpl in
-                        Text(tmpl.name).tag(tmpl.id)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    minuteTemplatePickerView
+                        .frame(minWidth: 140, maxWidth: 220)
+
+                    Button("このテンプレートで再生成", systemImage: "sparkles") {
+                        generateOrUpdateFullMinutes()
                     }
-                }
-                .controlSize(.small)
-                .frame(width: 240)
-
-                Button("このテンプレートで再生成", systemImage: "sparkles") {
-                    generateOrUpdateFullMinutes()
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-
-                Spacer()
-
-                if let meeting = currentMeeting {
-                    Button("編集を保存", systemImage: "checkmark.circle") {
-                        try? workspace.llmService.updateMeetingMarkdown(meetingId: meeting.id, markdown: editableMinutesMarkdown)
-                        workspace.statusBannerMessage = "議事録を保存しました"
-                    }
+                    .buttonStyle(.borderedProminent)
                     .controlSize(.small)
-                    .buttonStyle(.bordered)
+
+                    Spacer(minLength: 4)
+
+                    minuteSaveButtonView
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        minuteTemplatePickerView
+                            .frame(maxWidth: .infinity)
+
+                        Button("再生成", systemImage: "sparkles") {
+                            generateOrUpdateFullMinutes()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    }
+
+                    HStack {
+                        Spacer()
+                        minuteSaveButtonView
+                    }
                 }
             }
 
@@ -478,6 +538,27 @@ public struct MeetingPartnerView: View {
                 .font(.system(.body, design: .monospaced))
                 .padding(8)
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+        }
+    }
+
+    private var minuteTemplatePickerView: some View {
+        Picker("議事録テンプレート", selection: $selectedTemplateId) {
+            ForEach(workspace.llmService.templates) { tmpl in
+                Text(tmpl.name).tag(tmpl.id)
+            }
+        }
+        .controlSize(.small)
+    }
+
+    @ViewBuilder
+    private var minuteSaveButtonView: some View {
+        if let meeting = currentMeeting {
+            Button("編集を保存", systemImage: "checkmark.circle") {
+                try? workspace.llmService.updateMeetingMarkdown(meetingId: meeting.id, markdown: editableMinutesMarkdown)
+                workspace.statusBannerMessage = "議事録を保存しました"
+            }
+            .controlSize(.small)
+            .buttonStyle(.bordered)
         }
     }
 
@@ -497,46 +578,64 @@ public struct MeetingPartnerView: View {
         let digest = workspace.meetingPartnerService.liveDigest
 
         return VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Label("リアルタイム議論要約", systemImage: "brain.head.profile")
-                    .font(.headline)
-                    .foregroundStyle(.purple)
-
-                if workspace.meetingPartnerService.isSummarizingWithLLM {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text("LLM推論中...")
-                        .font(.caption2)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    Label("リアルタイム議論要約", systemImage: "brain.head.profile")
+                        .font(.headline)
                         .foregroundStyle(.purple)
-                }
 
-                Spacer()
-
-                Picker("要約LLM", selection: Binding(
-                    get: { workspace.modelManager.globalSettings.llmModelId },
-                    set: { newLLMId in
-                        var s = workspace.modelManager.globalSettings
-                        s.llmModelId = newLLMId
-                        try? workspace.modelManager.updateGlobalSettings(s)
-                        workspace.refreshMeetingPartnerState()
+                    if workspace.meetingPartnerService.isSummarizingWithLLM {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("LLM推論中...")
+                            .font(.caption2)
+                            .foregroundStyle(.purple)
                     }
-                )) {
-                    ForEach(workspace.modelManager.models(for: .llm)) { model in
-                        let statusMark = model.downloadState == .installed ? "" : " [未DL]"
-                        Text("\(model.name)\(statusMark)").tag(model.id)
+
+                    Spacer(minLength: 4)
+
+                    summaryLLMPickerView
+                        .frame(minWidth: 140, maxWidth: 215)
+
+                    Button("議事録として確定", systemImage: "doc.badge.checkmark") {
+                        generateOrUpdateFullMinutes()
+                        leftTab = .finalizedMinutes
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.purple)
+                    .controlSize(.small)
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Label("リアルタイム議論要約", systemImage: "brain.head.profile")
+                            .font(.headline)
+                            .foregroundStyle(.purple)
+
+                        if workspace.meetingPartnerService.isSummarizingWithLLM {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+
+                        Spacer(minLength: 4)
+
+                        Button("議事録として確定", systemImage: "doc.badge.checkmark") {
+                            generateOrUpdateFullMinutes()
+                            leftTab = .finalizedMinutes
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.purple)
+                        .controlSize(.small)
+                    }
+
+                    HStack(spacing: 6) {
+                        Text("要約LLM:")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        summaryLLMPickerView
+                            .frame(maxWidth: .infinity)
                     }
                 }
-                .labelsHidden()
-                .controlSize(.small)
-                .frame(width: 215)
-
-                Button("議事録として確定", systemImage: "doc.badge.checkmark") {
-                    generateOrUpdateFullMinutes()
-                    leftTab = .finalizedMinutes
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.purple)
-                .controlSize(.small)
             }
 
             // 現在の論点バナー
@@ -614,14 +713,35 @@ public struct MeetingPartnerView: View {
         .background(.regularMaterial)
     }
 
+    private var summaryLLMPickerView: some View {
+        Picker("要約LLM", selection: Binding(
+            get: { workspace.modelManager.globalSettings.llmModelId },
+            set: { newLLMId in
+                var s = workspace.modelManager.globalSettings
+                s.llmModelId = newLLMId
+                try? workspace.modelManager.updateGlobalSettings(s)
+                workspace.refreshMeetingPartnerState()
+            }
+        )) {
+            ForEach(workspace.modelManager.models(for: .llm)) { model in
+                let statusMark = model.downloadState == .installed ? "" : " [未DL]"
+                Text("\(model.name)\(statusMark)").tag(model.id)
+            }
+        }
+        .labelsHidden()
+        .controlSize(.small)
+    }
+
     private var lowerRelatedDocumentsPane: some View {
         let suggestions = workspace.meetingPartnerService.relatedSuggestions
 
         return VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Label("会話に関連する資料・過去議事録の自動提案", systemImage: "Sparkles.rectangle.stack.fill")
+                Label("会話に関連する資料・過去議事録の自動提案", systemImage: "sparkles.rectangle.stack.fill")
                     .font(.headline)
                     .foregroundStyle(.blue)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                 Spacer()
                 if workspace.meetingPartnerService.previewingSuggestion != nil {
                     Button("提案一覧に戻る", systemImage: "chevron.left") {
