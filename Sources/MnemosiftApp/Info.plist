@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.mnemosift.app</string>
+    <key>CFBundleName</key>
+    <string>Mnemosift</string>
+    <key>CFBundleDisplayName</key>
+    <string>Mnemosift</string>
+    <key>CFBundleExecutable</key>
+    <string>Mnemosift</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>会議の音声を録音し、ローカルAIでリアルタイムに文字起こしするためにマイクを使用します。</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>録音された音声をデバイス上でリアルタイムに文字起こしするために音声認識を使用します。</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>YouTubeやWeb会議などのシステム音声をキャプチャして文字起こしするために画面とシステムオーディオの録音を使用します。</string>
+</dict>
+</plist>

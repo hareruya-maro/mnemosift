@@ -34,7 +34,16 @@ let package = Package(
         .executableTarget(
             name: "MnemosiftApp",
             dependencies: ["MnemosiftCore"],
-            path: "Sources/MnemosiftApp"
+            path: "Sources/MnemosiftApp",
+            exclude: ["Info.plist"],
+            linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__info_plist",
+                    "-Xlinker", "Sources/MnemosiftApp/Info.plist"
+                ])
+            ]
         ),
         .testTarget(
             name: "MnemosiftTests",

@@ -6,7 +6,7 @@ import ScreenCaptureKit
 import Accelerate
 
 /// リアルタイム音声キャプチャ（マイク ＆ ScreenCaptureKit システム音声）と
-/// オンデバイス音声認識（SFSpeechRecognizer）を実行するネイティブストリーミングエンジン
+/// 音声認識（SFSpeechRecognizer）を実行するネイティブストリーミングエンジン
 public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     private let stateQueue = DispatchQueue(label: "com.mnemosift.livestream.queue")
 
@@ -15,6 +15,7 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var hotwords: [String] = []
+    private var useOnDeviceRecognition: Bool = false
 
     // 共通オーディオフォーマット (16kHz モノラル Float32)
     private let commonAudioFormat: AVAudioFormat
@@ -22,14 +23,16 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
     // マイクキャプチャ
     private var audioEngine: AVAudioEngine?
     private var audioFile: AVAudioFile?
-    private var micConverter: AVAudioConverter?
+    private var isMicrophoneActive: Bool = false
 
     // システム音声キャプチャ (ScreenCaptureKit)
     private var systemAudioStream: SCStream?
-    private var sysConverter: AVAudioConverter?
+    private var systemAudioRingBuffer: [Float] = []
+    private let maxRingBufferSamples = 16000 * 3 // 最大3秒分保持
 
     // 状態管理
     private var isRunningInternal: Bool = false
+    private var activeSource: AudioSourceType = .microphoneAndSystem
     private var lastSpokenTime: Date = Date()
     private var currentProvisionalText: String = ""
     private var silenceWatchdogTimer: DispatchSourceTimer?
@@ -58,13 +61,33 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
         stop()
     }
 
-    // MARK: - 権限チェック・要求
+    // MARK: - バンドル・権限チェック
+
+    /// macOS の TCC は、SFSpeechRecognizer を .app バンドル（LaunchServices 経由）以外から呼ぶと
+    /// __TCC_CRASHING_DUE_TO_PRIVACY_VIOLATION__ でプロセスを強制終了させるため、実行環境を判定する
+    public static var canSafelyUseSpeechRecognizerTCC: Bool {
+        if ProcessInfo.processInfo.environment["MNEMOSIFT_LAUNCHED_AS_APP"] == "1" {
+            return true
+        }
+        let bundlePath = Bundle.main.bundlePath
+        let execPath = ProcessInfo.processInfo.arguments.first ?? ""
+        // MnemosiftTests などのテストランナー実行時は false にする
+        if bundlePath.contains(".xctest") || execPath.contains("swiftpm-testing-helper") {
+            return false
+        }
+        return bundlePath.hasSuffix(".app") && Bundle.main.object(forInfoDictionaryKey: "NSSpeechRecognitionUsageDescription") != nil
+    }
 
     public static func requestPermissions() async -> (mic: Bool, speech: Bool) {
         let micStatus = await withCheckedContinuation { continuation in
             AVCaptureDevice.requestAccess(for: .audio) { granted in
                 continuation.resume(returning: granted)
             }
+        }
+
+        // TCC Privacy Violation クラッシュ防止ガード
+        guard canSafelyUseSpeechRecognizerTCC else {
+            return (micStatus, false)
         }
 
         let speechStatus = await withCheckedContinuation { continuation in
@@ -101,11 +124,14 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
         stateQueue.sync {
             guard !self.isRunningInternal else { return }
 
+            self.activeSource = source
             self.sessionStartTime = Date()
             self.lastSpokenTime = Date()
             self.lastFinalizedTimeSeconds = 0.0
             self.currentProvisionalText = ""
             self.hotwords = hotwords
+            self.systemAudioRingBuffer.removeAll(keepingCapacity: true)
+            self.isMicrophoneActive = false
 
             // 1. 録音先 WAV ファイル作成
             let recordingSettings: [String: Any] = [
@@ -118,19 +144,22 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
             ]
             self.audioFile = try? AVAudioFile(forWriting: destinationWAVURL, settings: recordingSettings)
 
-            // 2. 音声認識セッション初期化
-            do {
-                try self.setupSpeechRecognitionLocked(hotwords: hotwords)
-            } catch {
-                startError = error
-                return
+            // 2. 音声認識セッション初期化（TCC安全環境のみ）
+            if Self.canSafelyUseSpeechRecognizerTCC {
+                do {
+                    try self.setupSpeechRecognitionLocked(hotwords: hotwords)
+                } catch {
+                    startError = error
+                }
             }
 
             // 3. マイクキャプチャ開始
             if source == .microphone || source == .microphoneAndSystem {
                 do {
                     try self.setupMicrophoneCaptureLocked()
+                    self.isMicrophoneActive = true
                 } catch {
+                    self.isMicrophoneActive = false
                     self.onError?("マイク入力の開始に失敗しました: \(error.localizedDescription)")
                 }
             }
@@ -153,6 +182,7 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
         stateQueue.sync {
             guard self.isRunningInternal else { return }
             self.isRunningInternal = false
+            self.isMicrophoneActive = false
 
             self.stopSilenceWatchdogLocked()
 
@@ -163,7 +193,7 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
             }
             self.audioEngine = nil
             self.audioFile = nil
-            self.micConverter = nil
+            self.systemAudioRingBuffer.removeAll()
 
             // システム音声ストリーム停止
             if let stream = self.systemAudioStream {
@@ -171,7 +201,6 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
                     try? await stream.stopCapture()
                 }
                 self.systemAudioStream = nil
-                self.sysConverter = nil
             }
 
             // 最後の発話を確定して認識タスクを終了
@@ -197,50 +226,33 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
             throw NSError(domain: "LiveAudioStreamEngine", code: 1, userInfo: [NSLocalizedDescriptionKey: "有効なマイク入力デバイスが見つかりません"])
         }
 
-        let targetFormat = self.commonAudioFormat
-
         inputNode.removeTap(onBus: 0)
-        // format に nil を渡すことで、ノードの内部バス形式と合致させ、CoreAudio の format mismatch 例外を防止する
         inputNode.installTap(onBus: 0, bufferSize: 2048, format: nil) { [weak self] buffer, _ in
-            guard let self, self.stateQueue.sync(execute: { self.isRunningInternal }) else { return }
+            guard let self else { return }
 
-            // 1. RMS レベルメーター
-            let rmsLevel = Self.calculateRMSLevel(buffer: buffer)
-            self.onLevelMeterUpdate?(rmsLevel)
+            let micSamples16k = Self.extractMono16kHzSamples(from: buffer)
+            guard !micSamples16k.isEmpty else { return }
 
-            // 2. 16kHz モノラル Float32 に変換して供給
-            let sourceFormat = buffer.format
-            guard sourceFormat.sampleRate > 0 else { return }
+            self.stateQueue.async {
+                guard self.isRunningInternal else { return }
 
-            let converter: AVAudioConverter?
-            if let existing = self.micConverter, existing.inputFormat == sourceFormat {
-                converter = existing
-            } else {
-                converter = AVAudioConverter(from: sourceFormat, to: targetFormat)
-                self.micConverter = converter
-            }
-
-            guard let converter else { return }
-            let frameCapacity = AVAudioFrameCount(Double(buffer.frameLength) * (16000.0 / sourceFormat.sampleRate))
-            if frameCapacity > 0, let convertedBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: frameCapacity) {
-                var error: NSError?
-                var allConsumed = false
-                converter.convert(to: convertedBuffer, error: &error) { _, outStatus in
-                    if !allConsumed {
-                        allConsumed = true
-                        outStatus.pointee = .haveData
-                        return buffer
-                    } else {
-                        outStatus.pointee = .noDataNow
-                        return nil
+                // システム音声とのミキシング（microphoneAndSystem の場合、1本の連続ストリームに合成）
+                var mixedSamples = micSamples16k
+                if self.activeSource == .microphoneAndSystem && !self.systemAudioRingBuffer.isEmpty {
+                    let count = min(mixedSamples.count, self.systemAudioRingBuffer.count)
+                    for i in 0..<count {
+                        let sum = mixedSamples[i] + self.systemAudioRingBuffer[i]
+                        mixedSamples[i] = max(-1.0, min(1.0, sum))
                     }
+                    self.systemAudioRingBuffer.removeFirst(count)
                 }
 
-                if error == nil && convertedBuffer.frameLength > 0 {
-                    self.stateQueue.async {
-                        self.recognitionRequest?.append(convertedBuffer)
-                        try? self.audioFile?.write(from: convertedBuffer)
-                    }
+                let rmsLevel = Self.calculateRMSLevel(samples: mixedSamples)
+                self.onLevelMeterUpdate?(rmsLevel)
+
+                if let pcmBuffer = Self.makePCMBuffer(from: mixedSamples, format: self.commonAudioFormat) {
+                    self.recognitionRequest?.append(pcmBuffer)
+                    try? self.audioFile?.write(from: pcmBuffer)
                 }
             }
         }
@@ -269,9 +281,9 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
                 let filter = SCContentFilter(display: display, excludingWindows: [])
                 let config = SCStreamConfiguration()
                 config.capturesAudio = true
-                config.excludesCurrentProcessAudio = true // 自アプリの音響ループ防止
-                config.sampleRate = 16000
-                config.channelCount = 1
+                config.excludesCurrentProcessAudio = true
+                config.sampleRate = 48000
+                config.channelCount = 2
 
                 let stream = SCStream(filter: filter, configuration: config, delegate: self)
                 try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: DispatchQueue(label: "com.mnemosift.scaudio"))
@@ -287,16 +299,30 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
     }
 
     public func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .audio, stateQueue.sync(execute: { self.isRunningInternal }) else { return }
+        guard type == .audio else { return }
 
-        if let pcmBuffer = Self.createPCMBuffer(from: sampleBuffer, targetFormat: commonAudioFormat) {
-            let level = Self.calculateRMSLevel(buffer: pcmBuffer)
-            if level > 0.05 {
-                onLevelMeterUpdate?(level)
-            }
-            stateQueue.async {
-                self.recognitionRequest?.append(pcmBuffer)
-                try? self.audioFile?.write(from: pcmBuffer)
+        let sysSamples16k = Self.extractMono16kHzSamples(from: sampleBuffer)
+        guard !sysSamples16k.isEmpty else { return }
+
+        stateQueue.async { [weak self] in
+            guard let self, self.isRunningInternal else { return }
+
+            if self.activeSource == .microphoneAndSystem && self.isMicrophoneActive {
+                // マイクストリーム側で1本のストリームとしてミキシング消費するためリングバッファへ追加
+                self.systemAudioRingBuffer.append(contentsOf: sysSamples16k)
+                if self.systemAudioRingBuffer.count > self.maxRingBufferSamples {
+                    let overflow = self.systemAudioRingBuffer.count - self.maxRingBufferSamples
+                    self.systemAudioRingBuffer.removeFirst(overflow)
+                }
+            } else {
+                // システム音声のみモード（またはマイク非稼働時）は直接 SpeechRecognizer へ供給
+                let level = Self.calculateRMSLevel(samples: sysSamples16k)
+                self.onLevelMeterUpdate?(level)
+
+                if let pcmBuffer = Self.makePCMBuffer(from: sysSamples16k, format: self.commonAudioFormat) {
+                    self.recognitionRequest?.append(pcmBuffer)
+                    try? self.audioFile?.write(from: pcmBuffer)
+                }
             }
         }
     }
@@ -304,14 +330,17 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
     // MARK: - SFSpeechRecognizer セットアップ & 発話監視
 
     private func setupSpeechRecognitionLocked(hotwords: [String]) throws {
+        guard Self.canSafelyUseSpeechRecognizerTCC else { return }
         guard let recognizer = speechRecognizer else {
             throw NSError(domain: "LiveAudioStreamEngine", code: 4, userInfo: [NSLocalizedDescriptionKey: "日本語の音声認識が利用できません"])
         }
 
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        if recognizer.supportsOnDeviceRecognition {
+        if useOnDeviceRecognition && recognizer.supportsOnDeviceRecognition {
             request.requiresOnDeviceRecognition = true
+        } else {
+            request.requiresOnDeviceRecognition = false
         }
         if !hotwords.isEmpty {
             request.contextualStrings = Array(hotwords.prefix(50))
@@ -340,9 +369,12 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
 
             if let error {
                 let nsErr = error as NSError
-                // 209 (kAFAssistantErrorDomain Code=209), 216 (Task cancelled) 以外は再接続
+                // 209 / 216 (キャンセル) 以外のエラー時は自動再接続
                 if nsErr.code != 209 && nsErr.code != 216 {
                     self.stateQueue.sync {
+                        if self.useOnDeviceRecognition {
+                            self.useOnDeviceRecognition = false
+                        }
                         if self.isRunningInternal {
                             self.resetSpeechRequestLocked()
                         }
@@ -401,41 +433,77 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
         try? setupSpeechRecognitionLocked(hotwords: self.hotwords)
     }
 
-    // MARK: - ユーティリティ (RMS計算 & バッファ変換)
+    // MARK: - ステートレス 16kHz モノラル変換 & RMS 計算
 
-    private static func calculateRMSLevel(buffer: AVAudioPCMBuffer) -> Double {
-        guard let channelData = buffer.floatChannelData else { return 0.0 }
-        let channelCount = Int(buffer.format.channelCount)
-        let length = vDSP_Length(buffer.frameLength)
-        guard length > 0 else { return 0.0 }
-
+    private static func calculateRMSLevel(samples: [Float]) -> Double {
+        guard !samples.isEmpty else { return 0.0 }
         var rms: Float = 0.0
-        vDSP_rmsqv(channelData[0], 1, &rms, length)
-        if channelCount > 1 {
-            var rms2: Float = 0.0
-            vDSP_rmsqv(channelData[1], 1, &rms2, length)
-            rms = (rms + rms2) / 2.0
-        }
-        let level = min(1.0, max(0.0, Double(rms) * 5.0))
-        return level
+        vDSP_rmsqv(samples, 1, &rms, vDSP_Length(samples.count))
+        return min(1.0, max(0.0, Double(rms) * 6.0))
     }
 
-    private static func createPCMBuffer(from sampleBuffer: CMSampleBuffer, targetFormat: AVAudioFormat) -> AVAudioPCMBuffer? {
+    private static func makePCMBuffer(from samples: [Float], format: AVAudioFormat) -> AVAudioPCMBuffer? {
+        guard !samples.isEmpty,
+              let pcmBuffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)),
+              let dst = pcmBuffer.floatChannelData?[0] else {
+            return nil
+        }
+        pcmBuffer.frameLength = AVAudioFrameCount(samples.count)
+        samples.withUnsafeBufferPointer { ptr in
+            if let base = ptr.baseAddress {
+                memcpy(dst, base, samples.count * MemoryLayout<Float>.size)
+            }
+        }
+        return pcmBuffer
+    }
+
+    private static func extractMono16kHzSamples(from buffer: AVAudioPCMBuffer) -> [Float] {
+        let frameLength = Int(buffer.frameLength)
+        let sampleRate = buffer.format.sampleRate
+        let channels = Int(buffer.format.channelCount)
+        guard frameLength > 0, sampleRate > 0, channels > 0 else { return [] }
+
+        var monoSource = [Float](repeating: 0, count: frameLength)
+        if let floatData = buffer.floatChannelData {
+            if channels >= 2 && !buffer.format.isInterleaved {
+                let ch0 = floatData[0]
+                let ch1 = floatData[1]
+                for i in 0..<frameLength {
+                    monoSource[i] = (ch0[i] + ch1[i]) * 0.5
+                }
+            } else if buffer.format.isInterleaved && channels >= 2 {
+                let ptr = floatData[0]
+                for i in 0..<frameLength {
+                    monoSource[i] = (ptr[i * channels] + ptr[i * channels + 1]) * 0.5
+                }
+            } else {
+                let ch0 = floatData[0]
+                for i in 0..<frameLength {
+                    monoSource[i] = ch0[i]
+                }
+            }
+        } else if let int16Data = buffer.int16ChannelData {
+            let ch0 = int16Data[0]
+            for i in 0..<frameLength {
+                monoSource[i] = Float(ch0[i]) / 32768.0
+            }
+        } else {
+            return []
+        }
+
+        return resampleTo16kHz(samples: monoSource, sourceSampleRate: sampleRate)
+    }
+
+    private static func extractMono16kHzSamples(from sampleBuffer: CMSampleBuffer) -> [Float] {
         guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
-              let audioStreamDesc = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) else {
-            return nil
+              let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) else {
+            return []
         }
-
-        guard let sourceFormat = AVAudioFormat(streamDescription: audioStreamDesc) else { return nil }
+        let asbd = asbdPtr.pointee
         let numSamples = CMSampleBufferGetNumSamples(sampleBuffer)
-        guard numSamples > 0 else { return nil }
+        guard numSamples > 0, asbd.mSampleRate > 0 else { return [] }
 
-        guard let sourcePCMBuffer = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: AVAudioFrameCount(numSamples)) else {
-            return nil
-        }
-        sourcePCMBuffer.frameLength = AVAudioFrameCount(numSamples)
-
-        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return nil }
+        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return [] }
         var lengthAtOffset = 0
         var totalLength = 0
         var dataPointer: UnsafeMutablePointer<CChar>?
@@ -446,40 +514,66 @@ public final class LiveAudioStreamEngine: NSObject, SCStreamOutput, SCStreamDele
             totalLengthOut: &totalLength,
             dataPointerOut: &dataPointer
         )
-        guard status == noErr, let dataPointer else { return nil }
+        guard status == noErr, let dataPointer, totalLength > 0 else { return [] }
 
-        if let destFloat = sourcePCMBuffer.floatChannelData?[0] {
-            memcpy(destFloat, dataPointer, min(totalLength, Int(sourcePCMBuffer.frameLength) * MemoryLayout<Float>.size))
-        } else if let destInt = sourcePCMBuffer.int16ChannelData?[0] {
-            memcpy(destInt, dataPointer, min(totalLength, Int(sourcePCMBuffer.frameLength) * MemoryLayout<Int16>.size))
-        }
+        let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+        let isNonInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
+        let channels = max(1, Int(asbd.mChannelsPerFrame))
 
-        if sourceFormat == targetFormat {
-            return sourcePCMBuffer
-        }
+        var monoSource = [Float](repeating: 0, count: numSamples)
 
-        guard let converter = AVAudioConverter(from: sourceFormat, to: targetFormat) else {
-            return sourcePCMBuffer
-        }
-
-        let targetCapacity = AVAudioFrameCount(Double(numSamples) * (targetFormat.sampleRate / sourceFormat.sampleRate))
-        guard targetCapacity > 0, let convertedBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: targetCapacity) else {
-            return sourcePCMBuffer
-        }
-
-        var error: NSError?
-        var consumed = false
-        converter.convert(to: convertedBuffer, error: &error) { _, outStatus in
-            if !consumed {
-                consumed = true
-                outStatus.pointee = .haveData
-                return sourcePCMBuffer
-            } else {
-                outStatus.pointee = .noDataNow
-                return nil
+        if isFloat {
+            let totalFloats = totalLength / MemoryLayout<Float>.size
+            dataPointer.withMemoryRebound(to: Float.self, capacity: totalFloats) { floatPtr in
+                if isNonInterleaved && channels >= 2 && totalFloats >= numSamples * 2 {
+                    for i in 0..<numSamples {
+                        monoSource[i] = (floatPtr[i] + floatPtr[numSamples + i]) * 0.5
+                    }
+                } else if !isNonInterleaved && channels >= 2 && totalFloats >= numSamples * channels {
+                    for i in 0..<numSamples {
+                        monoSource[i] = (floatPtr[i * channels] + floatPtr[i * channels + 1]) * 0.5
+                    }
+                } else {
+                    let count = min(numSamples, totalFloats)
+                    for i in 0..<count {
+                        monoSource[i] = floatPtr[i]
+                    }
+                }
             }
+        } else if asbd.mBitsPerChannel == 16 {
+            let totalShorts = totalLength / MemoryLayout<Int16>.size
+            dataPointer.withMemoryRebound(to: Int16.self, capacity: totalShorts) { shortPtr in
+                let count = min(numSamples, totalShorts / (isNonInterleaved ? 1 : channels))
+                for i in 0..<count {
+                    let idx = isNonInterleaved ? i : (i * channels)
+                    monoSource[i] = Float(shortPtr[idx]) / 32768.0
+                }
+            }
+        } else {
+            return []
         }
 
-        return error == nil ? convertedBuffer : sourcePCMBuffer
+        return resampleTo16kHz(samples: monoSource, sourceSampleRate: asbd.mSampleRate)
+    }
+
+    private static func resampleTo16kHz(samples: [Float], sourceSampleRate: Double) -> [Float] {
+        guard !samples.isEmpty else { return [] }
+        if abs(sourceSampleRate - 16000.0) < 1.0 {
+            return samples
+        }
+        let ratio = sourceSampleRate / 16000.0
+        let outCount = Int(Double(samples.count) / ratio)
+        guard outCount > 0 else { return [] }
+
+        var output = [Float](repeating: 0, count: outCount)
+        let maxIdx = samples.count - 1
+        for i in 0..<outCount {
+            let srcPos = Double(i) * ratio
+            let idx0 = min(maxIdx, Int(srcPos))
+            let idx1 = min(maxIdx, idx0 + 1)
+            let frac = Float(srcPos - Double(idx0))
+            output[i] = samples[idx0] * (1.0 - frac) + samples[idx1] * frac
+        }
+        return output
     }
 }
