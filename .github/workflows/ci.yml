@@ -8,8 +8,8 @@ on:
 
 jobs:
   build-and-test:
-    name: Build & Test (macOS 14)
-    runs-on: macos-14
+    name: Build & Test (macOS 15)
+    runs-on: macos-15
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
