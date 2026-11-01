@@ -15,3 +15,5 @@ DerivedData/
 *.db-wal
 /dist
 
+*.p8
+*.p12
