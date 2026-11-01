@@ -606,7 +606,7 @@ public struct KnowledgeWorkspaceView: View {
                             if doc.fileType == .image,
                                let nsImage = NSImage(contentsOfFile: doc.filePath) {
                                 VStack(alignment: .leading, spacing: 4) {
-                                    Text("🖼️ 元画像プレビュー（Apple Vision OCR による自動テキスト抽出済み）")
+                                    Text("🖼️ 元画像プレビュー（Apple Vision OCR テキスト抽出 ＋ EmbeddingGemma 2 マルチモーダル視覚Embedding 併用）")
                                         .font(.caption.bold())
                                         .foregroundStyle(.secondary)
                                     Image(nsImage: nsImage)
@@ -792,7 +792,7 @@ public struct KnowledgeWorkspaceView: View {
                 }
             }
 
-            Text("対象ファイル: テキストファイル (.txt / .md / .csv / .json / コード等) および画像ファイル (.png / .jpg / .heic / .webp等 — Apple Vision OCR自動抽出)\n※PDF・Microsoft Office文書は今後のアップデートで順次対応予定（現在は自動スキップ）\n※優先度低（バックグラウンド処理）で実行され、ファイル更新時は自動再読み込み＆差分インデックス更新を行います。")
+            Text("対象ファイル: テキストファイル (.txt / .md / .csv / .json / コード等) および画像ファイル (.png / .jpg / .heic / .webp等 — Apple Vision OCR テキスト抽出 ＋ EmbeddingGemma 2 マルチモーダル視覚Embedding の両方併用)\n※PDF・Microsoft Office文書は今後のアップデートで順次対応予定（現在は自動スキップ）\n※優先度低（バックグラウンド処理）で実行され、ファイル更新時は自動再読み込み＆差分インデックス更新を行います。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
 

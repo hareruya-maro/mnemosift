@@ -1193,6 +1193,17 @@ public final class IndexManager: @unchecked Sendable {
         var reusedCount = 0
         var generatedCount = 0
 
+        // 画像ファイルの場合は Vision OCR 抽出テキストに加えて EmbeddingGemma 2 マルチモーダル視覚特徴も融合して埋め込む
+        let multimodalImageURL: URL? = {
+            guard !sourceURI.isEmpty, sourceURI.hasPrefix("/") else { return nil }
+            let url = URL(fileURLWithPath: sourceURI)
+            guard DocumentService.detectFileType(for: url).isImageFile,
+                  FileManager.default.fileExists(atPath: url.path) else {
+                return nil
+            }
+            return url
+        }()
+
         // 8. 第1階層：文書要約 `search_unit` (`unit_type = .document`) の登録と Embedding 生成 (§4.4, §5.2)
         let docSearchUnitId = try repository.insertSearchUnit(SearchUnitRecord(
             documentId: id,
@@ -1204,7 +1215,7 @@ public final class IndexManager: @unchecked Sendable {
         ))
 
         let docVectorInput = "\(title) \(docKeywordsString) \(summaryText)"
-        let docVector = embeddingAdapter.generateEmbedding(for: docVectorInput)
+        let docVector = embeddingAdapter.generateMultimodalEmbedding(forText: docVectorInput, imageURL: multimodalImageURL)
         try repository.vectorStore.saveVector(StoredVectorRecord(
             searchUnitId: docSearchUnitId,
             embeddingModelId: embeddingAdapter.model.id,
@@ -1261,7 +1272,10 @@ public final class IndexManager: @unchecked Sendable {
                 ))
                 reusedCount += 1
             } else {
-                let chunkVec = embeddingAdapter.generateEmbedding(for: "\(chunkKws.joined(separator: " ")) \(planned.text)")
+                let chunkVec = embeddingAdapter.generateMultimodalEmbedding(
+                    forText: "\(chunkKws.joined(separator: " ")) \(planned.text)",
+                    imageURL: multimodalImageURL
+                )
                 try repository.vectorStore.saveVector(StoredVectorRecord(
                     searchUnitId: chunkUnitId,
                     embeddingModelId: embeddingAdapter.model.id,

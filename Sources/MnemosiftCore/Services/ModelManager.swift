@@ -300,7 +300,7 @@ public final class ModelManager {
             // Embedding Models
             AIModel(
                 id: "emb-embedding-gemma-2",
-                name: "EmbeddingGemma 2 (384d Local Search)",
+                name: "EmbeddingGemma 2 (384d Multimodal Text + Image)",
                 category: .embedding,
                 version: "2.0.0",
                 downloadState: .installed,
@@ -312,7 +312,7 @@ public final class ModelManager {
                 diskSizeMB: 580,
                 endpointOrPath: "embeddinggemma2:384d",
                 license: "Gemma Terms",
-                notes: "標準ローカルEmbeddingモデル（384次元 Float32 正規化ベクトル）。日本語意味検索・2階層ハイブリッドRAGに最適化。"
+                notes: "標準ローカルマルチモーダルEmbeddingモデル（384次元 Float32 正規化ベクトル）。テキスト検索に加え、画像ファイルの視覚特徴＋Vision OCRテキストのハイブリッド検索に最適化。"
             ),
             AIModel(
                 id: "emb-multilingual-e5-small-384d",

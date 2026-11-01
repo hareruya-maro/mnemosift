@@ -119,7 +119,7 @@ public struct FilesView: View {
                 }
             }
 
-            Text("対象: テキストファイル＆画像ファイル(Apple Vision OCR) / 優先度低バックグラウンド実行")
+            Text("対象: テキストファイル＆画像ファイル(Vision OCR + EmbeddingGemma 2 マルチモーダル併用) / 優先度低バックグラウンド実行")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
 

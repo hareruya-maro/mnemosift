@@ -48,6 +48,7 @@ public final class EmbeddingService {
         let embModel = modelManager.model(withId: modelManager.globalSettings.embeddingModelId)
             ?? modelManager.models(for: .embedding).first!
         let adapter = LocalEmbeddingAdapter(model: embModel)
+        let imageURL: URL? = document.fileType.isImageFile ? URL(fileURLWithPath: document.filePath) : nil
 
         let paragraphs = Self.splitIntoChunks(text: document.extractedText, maxLength: 360)
         for (idx, paragraph) in paragraphs.enumerated() {
@@ -63,7 +64,10 @@ public final class EmbeddingService {
                 isDecisionOrImportant: isImportant,
                 sourceUpdatedAt: document.updatedAt
             )
-            let vector = adapter.generateEmbedding(for: "\(document.fileName) \(document.tags.joined(separator: " ")) \(paragraph)")
+            let vector = adapter.generateMultimodalEmbedding(
+                forText: "\(document.fileName) \(document.tags.joined(separator: " ")) \(paragraph)",
+                imageURL: imageURL
+            )
             let record = EmbeddingRecord(
                 chunkId: chunk.id,
                 modelId: embModel.id,

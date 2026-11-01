@@ -643,12 +643,12 @@ public final class DocumentService {
         for doc in documents where doc.storageMode == .referencedInPlace {
             let stdOrig = URL(fileURLWithPath: doc.originalPath).standardizedFileURL.path
             if stdOrig.hasPrefix(normalizedFolderPath + "/") && !FileManager.default.fileExists(atPath: stdOrig) {
+                inaccessibleCount += 1
                 if var contentRec = try? embeddingService.documentRepository.fetchDocumentContent(documentId: doc.id.uuidString),
                    contentRec.isSourceAccessible {
                     contentRec.isSourceAccessible = false
                     contentRec.updatedAt = Date()
                     try? embeddingService.documentRepository.upsertDocumentContent(contentRec)
-                    inaccessibleCount += 1
                 }
             }
         }
@@ -727,14 +727,14 @@ public final class DocumentService {
 
         var tags = judgeOutput.suggestedTags
         if fileType == .image {
-            tags = Array(Set(tags + ["画像OCR"])).sorted()
+            tags = Array(Set(tags + ["画像OCR", "EmbeddingGemma2"])).sorted()
         }
 
         document.category = judgeOutput.category
         document.tags = tags
         document.summary = Self.buildLightweightSummary(from: extractedText)
         document.classificationStage = fileType == .image
-            ? "Vision OCR + 軽量判断モデル (\(config.judgeModel.name))"
+            ? "Vision OCR + EmbeddingGemma 2 マルチモーダル + 軽量判断モデル (\(config.judgeModel.name))"
             : "フォルダ一括取込 + 軽量判断モデル (\(config.judgeModel.name))"
         document.relatedDocumentIds = findRelatedDocumentIds(for: document)
 
@@ -914,7 +914,7 @@ public final class DocumentService {
         return scored.sorted { $0.1 > $1.1 }.prefix(3).map(\.0)
     }
 
-    public static func detectFileType(for url: URL) -> DocumentFileType {
+    nonisolated public static func detectFileType(for url: URL) -> DocumentFileType {
         switch url.pathExtension.lowercased() {
         case "txt", "log", "csv", "tsv", "rtf":
             .txt
@@ -957,7 +957,7 @@ public final class DocumentService {
         return ""
     }
 
-    /// Apple Vision (`VNRecognizeTextRequest`) を用いた画像ファイルのオンデバイスOCRテキスト抽出（日本語・英語対応）
+    /// Apple Vision (`VNRecognizeTextRequest`) によるテキスト抽出と EmbeddingGemma 2 視覚特徴解析の両方を融合して抽出する（日本語・英語対応）
     public static func extractTextFromImageUsingVision(at url: URL) -> String {
         var recognizedLines: [(minY: CGFloat, minX: CGFloat, text: String)] = []
 
@@ -993,11 +993,20 @@ public final class DocumentService {
             return a.minX < b.minX
         }.map(\.text)
 
+        let visualMeta = LocalEmbeddingAdapter.extractVisualDescriptor(from: url)?.metadataSummaryText
+
         if !ordered.isEmpty {
-            return ordered.joined(separator: "\n")
+            let ocrText = ordered.joined(separator: "\n")
+            if let visualMeta {
+                return "\(ocrText)\n\(visualMeta)"
+            }
+            return ocrText
         }
 
-        // 文字が含まれない画像（図形・アイコンのみ等）の場合もファイル名と解像度メタデータを保持する
+        // 文字が含まれない画像（図形・UIモック・写真・アイコンのみ等）の場合も EmbeddingGemma 2 視覚特徴メタデータを保持する
+        if let visualMeta {
+            return "[画像ファイル: \(url.lastPathComponent)]\n\(visualMeta)"
+        }
         if let img = NSImage(contentsOf: url) {
             let w = Int(img.size.width)
             let h = Int(img.size.height)
@@ -1006,12 +1015,14 @@ public final class DocumentService {
         return "[画像ファイル: \(url.lastPathComponent)]"
     }
 
-    /// テストおよびプレビュー生成用：指定したテキストを描画したPNG画像ファイルを生成する
+    /// テストおよびプレビュー生成用：指定したテキスト・背景色・文字色を描画したPNG画像ファイルを生成する
     @discardableResult
     public static func renderTextToPNGImageFile(
         lines: [String],
         to destinationURL: URL,
-        size: NSSize = NSSize(width: 960, height: 360)
+        size: NSSize = NSSize(width: 960, height: 360),
+        backgroundColor: NSColor = .white,
+        textColor: NSColor = .black
     ) throws -> URL {
         guard let bitmapRep = NSBitmapImageRep(
             bitmapDataPlanes: nil,
@@ -1031,12 +1042,12 @@ public final class DocumentService {
         NSGraphicsContext.saveGraphicsState()
         if let ctx = NSGraphicsContext(bitmapImageRep: bitmapRep) {
             NSGraphicsContext.current = ctx
-            NSColor.white.setFill()
+            backgroundColor.setFill()
             NSBezierPath(rect: NSRect(origin: .zero, size: size)).fill()
 
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.boldSystemFont(ofSize: 32),
-                .foregroundColor: NSColor.black
+                .foregroundColor: textColor
             ]
             var yCursor = size.height - 68
             for line in lines {

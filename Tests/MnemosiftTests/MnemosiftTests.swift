@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import Testing
 @testable import MnemosiftCore
 
@@ -990,7 +991,7 @@ struct MnemosiftTests {
         """
         try textFile2Content.write(to: textFile2URL, atomically: true, encoding: .utf8)
 
-        // Apple Vision OCR テスト用のテキスト描画 PNG 画像を生成
+        // Apple Vision OCR + EmbeddingGemma 2 マルチモーダルテスト用の PNG 画像を生成（白基調の明るい構成図＋黒基調の暗いUIモック）
         let imageFileURL = rootFolderURL.appendingPathComponent("whiteboard_diagram.png")
         try DocumentService.renderTextToPNGImageFile(
             lines: [
@@ -998,7 +999,20 @@ struct MnemosiftTests {
                 "GraphQL Federation Gateway 2026",
                 "ZeroTrust Network Policy Enabled"
             ],
-            to: imageFileURL
+            to: imageFileURL,
+            backgroundColor: .white,
+            textColor: .black
+        )
+
+        let darkMockImageURL = subFolderURL.appendingPathComponent("console_dashboard_mock.png")
+        try DocumentService.renderTextToPNGImageFile(
+            lines: [
+                "Telemetry Console v3",
+                "Prometheus Metrics Stream"
+            ],
+            to: darkMockImageURL,
+            backgroundColor: NSColor(calibratedRed: 0.08, green: 0.09, blue: 0.12, alpha: 1.0),
+            textColor: .white
         )
 
         // 今後の対応対象（現時点では一括読み込み対象外としてスキップされるべきファイル）
@@ -1014,10 +1028,10 @@ struct MnemosiftTests {
             includeSubdirectories: true
         )
 
-        // テキスト2件＋画像1件＝計3件のみが取り込まれ、PDFとWord(.docx)の2件はスキップされること
-        #expect(summary1.newlyImportedCount == 3)
+        // テキスト2件＋画像2件＝計4件のみが取り込まれ、PDFとWord(.docx)の2件はスキップされること
+        #expect(summary1.newlyImportedCount == 4)
         #expect(summary1.textImportedCount == 2)
-        #expect(summary1.imageImportedCount == 1)
+        #expect(summary1.imageImportedCount == 2)
         #expect(summary1.unsupportedSkippedCount == 2)
         #expect(ws.documentService.watchedFolders.contains(rootFolderURL.standardizedFileURL.path))
         #expect(ws.documentService.watchedFolderRecords.contains(where: { $0.folderPath == rootFolderURL.standardizedFileURL.path }))
@@ -1028,7 +1042,7 @@ struct MnemosiftTests {
         #expect(bulkJobs.first?.priority == .lowBackground)
         #expect(bulkJobs.first?.status == .completed)
 
-        // 3. 読み込まれたテキストファイルおよび画像ファイル(Vision OCR)が2階層ハイブリッド検索でヒットすること
+        // 3. 読み込まれたテキストファイルおよび画像ファイル(Vision OCR + EmbeddingGemma 2 マルチモーダル)が2階層ハイブリッド検索でヒットすること
         let textHits = ws.searchService.searchDocuments(query: "Memcached 300秒", mode: .hybrid)
         #expect(textHits.first?.title == "architecture_plan.md")
 
@@ -1038,10 +1052,20 @@ struct MnemosiftTests {
         let ocrImageDoc = try #require(ws.documentService.documents.first(where: { $0.fileName == "whiteboard_diagram.png" }))
         #expect(ocrImageDoc.fileType == .image)
         #expect(ocrImageDoc.storageMode == .referencedInPlace)
+        #expect(ocrImageDoc.tags.contains("EmbeddingGemma2"))
         #expect(ocrImageDoc.extractedText.localizedCaseInsensitiveContains("GraphQL") || ocrImageDoc.extractedText.localizedCaseInsensitiveContains("ZeroTrust"))
+        #expect(ocrImageDoc.extractedText.contains("EmbeddingGemma 2 視覚特徴"))
 
+        // (a) Vision OCR による画像内テキストキーワード検索
         let imageOCRHits = ws.searchService.searchDocuments(query: "GraphQL ZeroTrust", mode: .hybrid)
         #expect(imageOCRHits.contains(where: { $0.documentId == ocrImageDoc.id.uuidString }))
+
+        // (b) EmbeddingGemma 2 マルチモーダル視覚特徴（画像内の文字には「暗い」「ダークモード」と書いていなくても、黒基調画像の視覚特徴＋OCRテキストの両方で検索ヒットすること）
+        let darkImageDoc = try #require(ws.documentService.documents.first(where: { $0.fileName == "console_dashboard_mock.png" }))
+        let visualDescriptor = try #require(LocalEmbeddingAdapter.extractVisualDescriptor(from: darkMockImageURL))
+        #expect(visualDescriptor.isDarkVisual == true)
+        let darkVisualHits = ws.searchService.searchDocuments(query: "暗い配色 ダークモード Telemetry", mode: .hybrid)
+        #expect(darkVisualHits.first?.documentId == darkImageDoc.id.uuidString)
 
         // 対象外の PDF / Word ファイルは登録されていないこと
         #expect(!ws.documentService.documents.contains(where: { $0.fileName == "legacy_manual.pdf" }))
@@ -1055,7 +1079,7 @@ struct MnemosiftTests {
         )
         #expect(summaryUnchanged.newlyImportedCount == 0)
         #expect(summaryUnchanged.updatedReloadedCount == 0)
-        #expect(summaryUnchanged.unchangedSkippedCount == 3)
+        #expect(summaryUnchanged.unchangedSkippedCount == 4)
 
         // 5. ファイル更新時の自動再読み込み（DispatchSourceFileSystemObject イベント検知＋デバウンス自動同期）の検証
         let textFile1Updated = """

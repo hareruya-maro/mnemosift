@@ -40,9 +40,9 @@
 
 ## 3. 資料解析・出力フォーマット拡張
 
-### - [x] テキストファイル・画像ファイル（Apple Vision OCR）のフォルダ一括読み込み・自動再読み込み対応
+### - [x] テキストファイル・画像ファイル（Apple Vision OCR テキスト抽出 ＋ EmbeddingGemma 2 マルチモーダル視覚Embedding 併用）のフォルダ一括読み込み・自動再読み込み対応
 - **優先度**: 高
-- **概要**: 指定フォルダ配下のテキスト系ファイル（`.txt`, `.md`, `.csv`, `.json`, ソースコード等）と画像ファイル（`.png`, `.jpg`, `.heic`, `.webp` 等 — Apple Vision `VNRecognizeTextRequest` によるオンデバイスOCR）を優先度低（`.lowBackground`）のバックグラウンドジョブとして一括読み込みし、`DispatchSourceFileSystemObject` によりファイル更新時の自動再読み込み・差分インデックス更新を実行。
+- **概要**: 指定フォルダ配下のテキスト系ファイル（`.txt`, `.md`, `.csv`, `.json`, ソースコード等）と画像ファイル（`.png`, `.jpg`, `.heic`, `.webp` 等 — Apple Vision `VNRecognizeTextRequest` によるオンデバイスOCRテキスト抽出と、`EmbeddingGemma 2` による視覚特徴［明度・色調・4x4空間パッチ］＋テキストのマルチモーダル384次元Embeddingの両方を併用）を優先度低（`.lowBackground`）のバックグラウンドジョブとして一括読み込みし、`DispatchSourceFileSystemObject` によりファイル更新時の自動再読み込み・差分インデックス更新を実行。
 
 ### - [ ] PDF および Microsoft Office文書（Word / Excel / PowerPoint）の一括読み込み対応
 - **優先度**: 中
