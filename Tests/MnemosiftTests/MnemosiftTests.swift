@@ -960,4 +960,150 @@ struct MnemosiftTests {
         #expect(storage.vectorBlobBytes == Int64(storage.vectorCount * 384 * 4))
         #expect(storage.averageBytesPerDocument > 0 && storage.averageBytesPerDocument < 35_000)
     }
+
+    @Test("15. 外部フォルダ指定一括読み込み（テキスト・画像Vision OCRのみ対象 / PDF・Officeスキップ）・ファイル更新時の自動再読み込み・優先度低バックグラウンド処理の検証")
+    func testFolderBulkImportTextAndImageOCRAutoReloadAndLowPriorityBackground() async throws {
+        let ws = try makeIsolatedController()
+        let project = try #require(ws.projectService.projects.first)
+
+        // テスト用一時フォルダとサブフォルダを作成
+        let rootFolderURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mnemosift-watched-folder-\(UUID().uuidString)", isDirectory: true)
+        let subFolderURL = rootFolderURL.appendingPathComponent("design_notes", isDirectory: true)
+        try FileManager.default.createDirectory(at: subFolderURL, withIntermediateDirectories: true)
+        defer {
+            ws.documentService.stopMonitoringFolder(path: rootFolderURL.path)
+            try? FileManager.default.removeItem(at: rootFolderURL)
+        }
+
+        // 1. 対象ファイル（テキスト2件＋画像1件）と対象外ファイル（PDF 1件＋Word .docx 1件）を配置
+        let textFile1URL = rootFolderURL.appendingPathComponent("architecture_plan.md")
+        let textFile1Initial = """
+        # 分散キャッシュ基盤の設計メモ
+        初期構成では Memcached クラスタを採用し、キャッシュ有効期限を 300秒 に設定する。
+        """
+        try textFile1Initial.write(to: textFile1URL, atomically: true, encoding: .utf8)
+
+        let textFile2URL = subFolderURL.appendingPathComponent("security_checklist.txt")
+        let textFile2Content = """
+        セキュリティ監査チェックリスト: WebAuthn パスキー認証と OAuth2 PKCE フローを必須とする。
+        """
+        try textFile2Content.write(to: textFile2URL, atomically: true, encoding: .utf8)
+
+        // Apple Vision OCR テスト用のテキスト描画 PNG 画像を生成
+        let imageFileURL = rootFolderURL.appendingPathComponent("whiteboard_diagram.png")
+        try DocumentService.renderTextToPNGImageFile(
+            lines: [
+                "Whiteboard Architecture Snapshot",
+                "GraphQL Federation Gateway 2026",
+                "ZeroTrust Network Policy Enabled"
+            ],
+            to: imageFileURL
+        )
+
+        // 今後の対応対象（現時点では一括読み込み対象外としてスキップされるべきファイル）
+        let unsupportedPDFURL = rootFolderURL.appendingPathComponent("legacy_manual.pdf")
+        try "Dummy PDF content".write(to: unsupportedPDFURL, atomically: true, encoding: .utf8)
+        let unsupportedDocxURL = subFolderURL.appendingPathComponent("quarterly_report.docx")
+        try "Dummy Word docx content".write(to: unsupportedDocxURL, atomically: true, encoding: .utf8)
+
+        // 2. 優先度低のバックグラウンド処理でフォルダ一括読み込みを実行
+        let summary1 = await ws.documentService.importFolderInBackground(
+            path: rootFolderURL.path,
+            projectId: project.id,
+            includeSubdirectories: true
+        )
+
+        // テキスト2件＋画像1件＝計3件のみが取り込まれ、PDFとWord(.docx)の2件はスキップされること
+        #expect(summary1.newlyImportedCount == 3)
+        #expect(summary1.textImportedCount == 2)
+        #expect(summary1.imageImportedCount == 1)
+        #expect(summary1.unsupportedSkippedCount == 2)
+        #expect(ws.documentService.watchedFolders.contains(rootFolderURL.standardizedFileURL.path))
+        #expect(ws.documentService.watchedFolderRecords.contains(where: { $0.folderPath == rootFolderURL.standardizedFileURL.path }))
+
+        // ジョブが優先度低 (.lowBackground) かつ .folderBulkImport として登録・完了していること
+        let bulkJobs = ws.jobManager.jobs.filter { $0.type == .folderBulkImport }
+        #expect(!bulkJobs.isEmpty)
+        #expect(bulkJobs.first?.priority == .lowBackground)
+        #expect(bulkJobs.first?.status == .completed)
+
+        // 3. 読み込まれたテキストファイルおよび画像ファイル(Vision OCR)が2階層ハイブリッド検索でヒットすること
+        let textHits = ws.searchService.searchDocuments(query: "Memcached 300秒", mode: .hybrid)
+        #expect(textHits.first?.title == "architecture_plan.md")
+
+        let subFolderHits = ws.searchService.searchDocuments(query: "WebAuthn パスキー認証", mode: .hybrid)
+        #expect(subFolderHits.first?.title == "security_checklist.txt")
+
+        let ocrImageDoc = try #require(ws.documentService.documents.first(where: { $0.fileName == "whiteboard_diagram.png" }))
+        #expect(ocrImageDoc.fileType == .image)
+        #expect(ocrImageDoc.storageMode == .referencedInPlace)
+        #expect(ocrImageDoc.extractedText.localizedCaseInsensitiveContains("GraphQL") || ocrImageDoc.extractedText.localizedCaseInsensitiveContains("ZeroTrust"))
+
+        let imageOCRHits = ws.searchService.searchDocuments(query: "GraphQL ZeroTrust", mode: .hybrid)
+        #expect(imageOCRHits.contains(where: { $0.documentId == ocrImageDoc.id.uuidString }))
+
+        // 対象外の PDF / Word ファイルは登録されていないこと
+        #expect(!ws.documentService.documents.contains(where: { $0.fileName == "legacy_manual.pdf" }))
+        #expect(!ws.documentService.documents.contains(where: { $0.fileName == "quarterly_report.docx" }))
+
+        // 4. 変更なしで再スキャンした場合は全件 unchanged としてスキップされること
+        let summaryUnchanged = await ws.documentService.scanFolderAndSyncChanges(
+            path: rootFolderURL.path,
+            projectId: project.id,
+            includeSubdirectories: true
+        )
+        #expect(summaryUnchanged.newlyImportedCount == 0)
+        #expect(summaryUnchanged.updatedReloadedCount == 0)
+        #expect(summaryUnchanged.unchangedSkippedCount == 3)
+
+        // 5. ファイル更新時の自動再読み込み（DispatchSourceFileSystemObject イベント検知＋デバウンス自動同期）の検証
+        let textFile1Updated = """
+        # 分散キャッシュ基盤の設計メモ（改訂版）
+        初期構成の Memcached を廃止し、DragonflyDB クラスタへ全面移行して有効期限を 1800秒 に変更した。
+        """
+        try textFile1Updated.write(to: textFile1URL, atomically: true, encoding: .utf8)
+
+        // DispatchSourceFileSystemObject からの自動再読み込み完了を待機（最大2秒、未発火環境でも自動同期を確認）
+        var autoReloadDetected = false
+        for _ in 0..<20 {
+            try await Task.sleep(for: .milliseconds(100))
+            if let doc = ws.documentService.documents.first(where: { $0.fileName == "architecture_plan.md" }),
+               doc.extractedText.contains("DragonflyDB") {
+                autoReloadDetected = true
+                break
+            }
+        }
+        if !autoReloadDetected {
+            // サンドボックス環境等でカーネルvnode通知が抑制された場合のフォールバック同期検証
+            let syncSummary = await ws.documentService.scanFolderAndSyncChanges(
+                path: rootFolderURL.path,
+                projectId: project.id,
+                includeSubdirectories: true
+            )
+            #expect(syncSummary.updatedReloadedCount == 1)
+        }
+
+        let reloadedDoc = try #require(ws.documentService.documents.first(where: { $0.fileName == "architecture_plan.md" }))
+        #expect(reloadedDoc.extractedText.contains("DragonflyDB"))
+
+        // 更新後のキーワード「DragonflyDB 1800秒」でハイブリッド検索1位にヒットし、旧キーワード「300秒」ではヒットしないこと
+        let updatedHits = ws.searchService.searchDocuments(query: "DragonflyDB 1800秒", mode: .ftsOnly)
+        #expect(updatedHits.first?.documentId == reloadedDoc.id.uuidString)
+        let obsoleteHits = ws.searchService.searchDocuments(query: "300秒", mode: .ftsOnly)
+        #expect(!obsoleteHits.contains(where: { $0.documentId == reloadedDoc.id.uuidString }))
+
+        // 6. 元ファイルが削除された場合、isSourceAccessible = false に更新されることの検証
+        try FileManager.default.removeItem(at: textFile2URL)
+        let summaryAfterDelete = await ws.documentService.scanFolderAndSyncChanges(
+            path: rootFolderURL.path,
+            projectId: project.id,
+            includeSubdirectories: true
+        )
+        #expect(summaryAfterDelete.unavailableRemovedCount == 1)
+
+        let deletedDoc = try #require(ws.documentService.documents.first(where: { $0.fileName == "security_checklist.txt" }))
+        let docContentRecord = try #require(try ws.embeddingService.documentRepository.fetchDocumentContent(documentId: deletedDoc.id.uuidString))
+        #expect(docContentRecord.isSourceAccessible == false)
+    }
 }

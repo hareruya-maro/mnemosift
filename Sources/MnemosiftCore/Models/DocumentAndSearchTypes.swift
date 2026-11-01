@@ -17,10 +17,136 @@ public enum DocumentStorageMode: String, Codable, CaseIterable, Sendable, Identi
 public enum DocumentFileType: String, Codable, CaseIterable, Sendable {
     case txt = "TXT"
     case markdown = "Markdown"
-    case pdf = "PDF"
     case json = "JSON"
     case sourceCode = "SourceCode"
+    case image = "Image"
+    case pdf = "PDF"
+    case officeDocument = "OfficeDocument"
     case other = "Other"
+
+    /// テキスト系ファイルかどうか
+    public var isTextFile: Bool {
+        switch self {
+        case .txt, .markdown, .json, .sourceCode:
+            return true
+        case .image, .pdf, .officeDocument, .other:
+            return false
+        }
+    }
+
+    /// 画像ファイル（Vision OCR対象）かどうか
+    public var isImageFile: Bool {
+        self == .image
+    }
+
+    /// 現在のフォルダ一括読み込み・自動再読み込みの対象形式かどうか
+    /// （現フェーズではテキストファイルと画像ファイルのみを対象とし、PDF・Microsoft Office文書は今後の拡張対象とする）
+    public var isSupportedInFolderBulkImport: Bool {
+        isTextFile || isImageFile
+    }
+
+    public var displayName: String {
+        switch self {
+        case .txt: "テキスト (TXT/CSV/LOG)"
+        case .markdown: "Markdown (MD)"
+        case .json: "JSON"
+        case .sourceCode: "ソースコード・設定"
+        case .image: "画像 (Vision OCR)"
+        case .pdf: "PDF (今後対応)"
+        case .officeDocument: "Office文書 (今後対応)"
+        case .other: "その他"
+        }
+    }
+}
+
+/// 監視・一括読み込み対象フォルダの永続化レコード
+public struct WatchedFolderRecord: Codable, Sendable, Identifiable, Equatable, Hashable {
+    public var id: UUID
+    public var folderPath: String
+    public var projectId: UUID?
+    public var includeSubdirectories: Bool
+    public var isEnabled: Bool
+    public var importedDocumentCount: Int
+    public var textDocumentCount: Int
+    public var imageDocumentCount: Int
+    public var skippedUnsupportedCount: Int
+    public var lastScannedAt: Date?
+    public var lastStatusSummary: String
+    public var createdAt: Date
+
+    public var lastSyncStatusMessage: String { lastStatusSummary }
+
+    public init(
+        id: UUID = UUID(),
+        folderPath: String,
+        projectId: UUID? = nil,
+        includeSubdirectories: Bool = true,
+        isEnabled: Bool = true,
+        importedDocumentCount: Int = 0,
+        textDocumentCount: Int = 0,
+        imageDocumentCount: Int = 0,
+        skippedUnsupportedCount: Int = 0,
+        lastScannedAt: Date? = nil,
+        lastStatusSummary: String = "待機中",
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.folderPath = folderPath
+        self.projectId = projectId
+        self.includeSubdirectories = includeSubdirectories
+        self.isEnabled = isEnabled
+        self.importedDocumentCount = importedDocumentCount
+        self.textDocumentCount = textDocumentCount
+        self.imageDocumentCount = imageDocumentCount
+        self.skippedUnsupportedCount = skippedUnsupportedCount
+        self.lastScannedAt = lastScannedAt
+        self.lastStatusSummary = lastStatusSummary
+        self.createdAt = createdAt
+    }
+}
+
+/// フォルダ指定一括読み込み・差分同期の実行結果サマリ
+public struct FolderBulkImportSummary: Codable, Sendable, Equatable, Hashable {
+    public var folderPath: String
+    public var scannedFileCount: Int
+    public var newlyImportedCount: Int
+    public var textImportedCount: Int
+    public var imageImportedCount: Int
+    public var updatedReloadedCount: Int
+    public var unchangedSkippedCount: Int
+    public var unsupportedSkippedCount: Int
+    public var inaccessibleMarkedCount: Int
+    public var durationMs: Double
+
+    public var unavailableRemovedCount: Int { inaccessibleMarkedCount }
+    public var elapsedMs: Double { durationMs }
+    public var statusSummaryText: String {
+        "新規\(newlyImportedCount)件 (Text \(textImportedCount) / 画像OCR \(imageImportedCount)) / 更新\(updatedReloadedCount)件 / 未変更\(unchangedSkippedCount)件 (対象外スキップ\(unsupportedSkippedCount)件)"
+    }
+
+    public init(
+        folderPath: String,
+        scannedFileCount: Int = 0,
+        newlyImportedCount: Int = 0,
+        textImportedCount: Int = 0,
+        imageImportedCount: Int = 0,
+        updatedReloadedCount: Int = 0,
+        unchangedSkippedCount: Int = 0,
+        unsupportedSkippedCount: Int = 0,
+        inaccessibleMarkedCount: Int = 0,
+        durationMs: Double = 0
+    ) {
+        self.folderPath = folderPath
+        self.scannedFileCount = scannedFileCount
+        self.newlyImportedCount = newlyImportedCount
+        self.textImportedCount = textImportedCount
+        self.imageImportedCount = imageImportedCount
+        self.updatedReloadedCount = updatedReloadedCount
+        self.unchangedSkippedCount = unchangedSkippedCount
+        self.unsupportedSkippedCount = unsupportedSkippedCount
+        self.inaccessibleMarkedCount = inaccessibleMarkedCount
+        self.durationMs = durationMs
+    }
 }
 
 public enum DocumentCategory: String, Codable, CaseIterable, Sendable, Identifiable {

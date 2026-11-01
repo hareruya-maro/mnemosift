@@ -1,12 +1,16 @@
 import Foundation
+import AppKit
 import PDFKit
+import Vision
 import CryptoKit
 import Observation
 
-/// 仕様書 §7: ファイル管理・解析・段階的分類・整理提案・フォルダ監視サービス
-/// - 管理領域コピー方式と元場所参照方式を明確に区別
-/// - ルール → Embedding → 判断モデル(System One) → LLM の段階的分類により、軽量処理で判断可能な場合は大型LLMを起動しない
-/// - リネーム・移動・タグ付け・プロジェクト関連付けはユーザー承認後に適用し、変更前後パスを保持してロールバック可能にする
+/// 仕様書 §7 & ローカルAIドキュメント検索仕様書 v1.0:
+/// ファイル管理・解析・段階的分類・整理提案・フォルダ指定一括読み込み・自動再読み込みサービス
+/// - 管理領域コピー方式と元場所参照方式（外部ドキュメント）を明確に区別
+/// - 外部フォルダ一括読み込み・監視では、まずテキストファイルと画像ファイル（Apple Vision オンデバイスOCR）を対象とし、
+///   優先度低（`.lowBackground`）のバックグラウンドジョブとして実行する
+/// - 監視対象フォルダ内のファイル更新・追加・削除を自動検知し、差分インデックス更新（未変更チャンクのEmbedding再利用）を実行する
 @Observable
 @MainActor
 public final class DocumentService {
@@ -19,7 +23,12 @@ public final class DocumentService {
     public private(set) var documents: [Document] = []
     public private(set) var operationHistories: [FileOperationHistory] = []
     public private(set) var watchedFolders: [String] = []
-    private var folderWatchers: [String: DispatchSourceFileSystemObject] = [:]
+    public private(set) var watchedFolderRecords: [WatchedFolderRecord] = []
+    public private(set) var lastFolderImportSummary: FolderBulkImportSummary?
+    public private(set) var isFolderSyncRunning: Bool = false
+
+    private var directoryAndFileWatchers: [String: DispatchSourceFileSystemObject] = [:]
+    private var debouncedFolderSyncTasks: [String: Task<Void, Never>] = [:]
 
     public init(
         database: LocalDatabase,
@@ -36,6 +45,17 @@ public final class DocumentService {
 
         self.documents = (try? database.loadDocuments()) ?? []
         self.operationHistories = (try? database.loadFileOperationHistories()) ?? []
+        let savedFolders = (try? database.loadWatchedFolders()) ?? []
+        self.watchedFolderRecords = savedFolders
+        self.watchedFolders = savedFolders.filter(\.isEnabled).map(\.folderPath)
+
+        for record in savedFolders where record.isEnabled {
+            installFileSystemWatchers(
+                forFolderPath: record.folderPath,
+                projectId: record.projectId,
+                includeSubdirectories: record.includeSubdirectories
+            )
+        }
     }
 
     /// ファイルを登録して解析・分類・Embeddingインデックス作成・整理提案生成を行う
@@ -72,7 +92,10 @@ public final class DocumentService {
             extractedText = Self.extractText(from: URL(fileURLWithPath: activeFilePath), fileType: fileType)
         }
 
-        let hash = Self.sha256Hex(of: extractedText)
+        let hash = Self.computeFileAndContentHash(
+            extractedText: extractedText,
+            fileURL: explicitContent == nil ? URL(fileURLWithPath: activeFilePath) : nil
+        )
         let sizeBytes = (try? FileManager.default.attributesOfItem(atPath: activeFilePath)[.size] as? Int64)
             ?? Int64(extractedText.utf8.count)
 
@@ -168,12 +191,17 @@ public final class DocumentService {
             matchedProjects.insert(pid)
         }
 
+        var extraTags = judgeOutput.suggestedTags
+        if document.fileType == .image {
+            extraTags = Array(Set(extraTags + ["画像OCR"])).sorted()
+        }
+
         if judgeOutput.calibratedConfidence >= config.judgeConfidenceThreshold {
             // 判断モデルのみで十分な確信度（>= 0.72）が得られたため、大型LLMを起動せず完了
             let summary = Self.buildLightweightSummary(from: document.extractedText)
             return (
                 category: judgeOutput.category,
-                tags: judgeOutput.suggestedTags,
+                tags: extraTags,
                 summary: summary,
                 matchedProjectIds: Array(matchedProjects),
                 relatedDocumentIds: findRelatedDocumentIds(for: document),
@@ -181,7 +209,7 @@ public final class DocumentService {
             )
         }
 
-        // Stage 3: 判断モデルで確信度が低い場合のみ LLM を起動して詳細分析
+        // Stage 3: 判断モデルで確信度が低い場合のみ LLM を起動して詳細分析（優先度低バックグラウンド）
         let llmModel = config.llmModel
         return try await jobManager.enqueueAndRun(
             type: .documentClassification,
@@ -191,7 +219,7 @@ public final class DocumentService {
             requiredMemoryMB: llmModel.requiredMemoryMB
         ) {
             let summary = Self.buildLightweightSummary(from: document.extractedText)
-            let enrichedTags = Array(Set(judgeOutput.suggestedTags + ["LLM詳細解析済み"])).sorted()
+            let enrichedTags = Array(Set(extraTags + ["LLM詳細解析済み"])).sorted()
             return (
                 (
                     category: judgeOutput.category,
@@ -265,7 +293,6 @@ public final class DocumentService {
         guard let dIdx = documents.firstIndex(where: { $0.id == history.documentId }) else { return }
         var doc = documents[dIdx]
 
-        // 実ファイルが存在し管理領域内にある場合は移動・リネームを実行
         let prevURL = URL(fileURLWithPath: history.previousFilePath)
         let nextURL = URL(fileURLWithPath: history.proposedFilePath)
         if FileManager.default.fileExists(atPath: prevURL.path) && prevURL.path != nextURL.path {
@@ -345,9 +372,9 @@ public final class DocumentService {
         try embeddingService.indexDocument(doc, projectIds: history.previousProjectIds)
     }
 
-    // MARK: - §2.1 & §11.2, §11.3 アプリ内登録ドキュメントの更新・削除と差分インデックス管理
+    // MARK: - §2.1 & §11.2, §11.3 ドキュメントの更新・削除と差分インデックス管理
 
-    /// アプリ内で登録したドキュメントの内容・タイトルを更新し、チャンクハッシュ比較による差分インデックス更新を行う（§11.2）
+    /// ドキュメントの内容・タイトルを更新し、チャンクハッシュ比較による差分インデックス更新を行う（§11.2）
     @discardableResult
     public func updateDocumentContent(
         documentId: UUID,
@@ -367,7 +394,6 @@ public final class DocumentService {
         doc.summary = Self.buildLightweightSummary(from: newContent)
         doc.updatedAt = Date()
 
-        // 管理領域コピー方式でローカルファイルが存在する場合はファイル内容も更新
         if doc.storageMode == .copiedToManagedStorage, !doc.filePath.isEmpty {
             try? newContent.write(toFile: doc.filePath, atomically: true, encoding: .utf8)
         }
@@ -379,10 +405,11 @@ public final class DocumentService {
         return try embeddingService.indexDocument(doc, projectIds: pids)
     }
 
-    /// アプリ内で登録したドキュメントを削除し、documents / document_contents / document_chunks / search_units / FTS5 / embeddings から完全削除する（§11.3）
+    /// ドキュメントを削除し、documents / document_contents / document_chunks / search_units / FTS5 / embeddings から完全削除する（§11.3）
     public func deleteDocument(documentId: UUID) throws {
         if let idx = documents.firstIndex(where: { $0.id == documentId }) {
             let doc = documents[idx]
+            stopWatchingPath(doc.originalPath)
             if doc.storageMode == .copiedToManagedStorage, FileManager.default.fileExists(atPath: doc.filePath) {
                 try? FileManager.default.removeItem(atPath: doc.filePath)
             }
@@ -393,69 +420,482 @@ public final class DocumentService {
         try embeddingService.deleteDocumentIndex(documentId: documentId)
     }
 
-    // MARK: - Folder Monitoring (仕様書 §7.5 自動分類・フォルダ監視)
+    // MARK: - フォルダ指定一括読み込み・ファイル更新時の自動再読み込み・低優先度バックグラウンド処理
 
-    public func startMonitoringFolder(path: String, projectId: UUID? = nil) {
-        guard !watchedFolders.contains(path) else { return }
-        watchedFolders.append(path)
+    /// フォルダを指定してテキストファイル・画像ファイルを優先度低（`.lowBackground`）のバックグラウンド処理として一括読み込み・差分同期し、自動監視を開始する
+    @discardableResult
+    public func importFolderInBackground(
+        path: String,
+        projectId: UUID? = nil,
+        includeSubdirectories: Bool = true
+    ) async -> FolderBulkImportSummary {
+        let normalizedPath = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL.path
+        startMonitoringFolder(path: normalizedPath, projectId: projectId, includeSubdirectories: includeSubdirectories)
 
-        let fd = open(path, O_EVTONLY)
+        let embModel = modelManager.model(withId: modelManager.globalSettings.embeddingModelId)
+            ?? modelManager.models(for: .embedding).first!
+
+        isFolderSyncRunning = true
+        defer { isFolderSyncRunning = false }
+
+        if let summary = try? await jobManager.enqueueAndRun(
+            type: .folderBulkImport,
+            title: "フォルダ一括読み込み・差分同期『\(URL(fileURLWithPath: normalizedPath).lastPathComponent)』",
+            priority: .lowBackground,
+            projectId: projectId,
+            modelId: embModel.id,
+            requiredMemoryMB: max(128, embModel.requiredMemoryMB / 2),
+            operation: {
+                let summary = await self.performFolderScanAndSync(
+                    normalizedFolderPath: normalizedPath,
+                    projectId: projectId,
+                    includeSubdirectories: includeSubdirectories
+                )
+                self.lastFolderImportSummary = summary
+                return (summary, summary.statusSummaryText)
+            }
+        ) {
+            return summary
+        }
+
+        let fallback = await performFolderScanAndSync(
+            normalizedFolderPath: normalizedPath,
+            projectId: projectId,
+            includeSubdirectories: includeSubdirectories
+        )
+        lastFolderImportSummary = fallback
+        return fallback
+    }
+
+    /// フォルダ監視を開始し、永続化レコードに保存する
+    public func startMonitoringFolder(
+        path: String,
+        projectId: UUID? = nil,
+        includeSubdirectories: Bool = true
+    ) {
+        let normalizedPath = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL.path
+        guard !normalizedPath.isEmpty else { return }
+
+        if !watchedFolders.contains(normalizedPath) {
+            watchedFolders.append(normalizedPath)
+        }
+
+        if let existingIdx = watchedFolderRecords.firstIndex(where: { $0.folderPath == normalizedPath }) {
+            watchedFolderRecords[existingIdx].isEnabled = true
+            watchedFolderRecords[existingIdx].projectId = projectId ?? watchedFolderRecords[existingIdx].projectId
+            watchedFolderRecords[existingIdx].includeSubdirectories = includeSubdirectories
+            try? database.saveWatchedFolder(watchedFolderRecords[existingIdx])
+        } else {
+            let record = WatchedFolderRecord(
+                folderPath: normalizedPath,
+                projectId: projectId,
+                includeSubdirectories: includeSubdirectories,
+                isEnabled: true
+            )
+            watchedFolderRecords.append(record)
+            try? database.saveWatchedFolder(record)
+        }
+
+        installFileSystemWatchers(
+            forFolderPath: normalizedPath,
+            projectId: projectId,
+            includeSubdirectories: includeSubdirectories
+        )
+    }
+
+    /// 監視対象フォルダを解除する
+    public func stopMonitoringFolder(path: String) {
+        removeWatchedFolder(path: path)
+    }
+
+    /// 監視対象フォルダを解除する
+    public func removeWatchedFolder(path: String) {
+        let normalizedPath = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL.path
+        watchedFolders.removeAll { $0 == normalizedPath }
+        debouncedFolderSyncTasks[normalizedPath]?.cancel()
+        debouncedFolderSyncTasks.removeValue(forKey: normalizedPath)
+
+        // 該当フォルダ配下のウォッチャーをすべて停止
+        let keysToStop = directoryAndFileWatchers.keys.filter { $0 == normalizedPath || $0.hasPrefix(normalizedPath + "/") }
+        for key in keysToStop {
+            stopWatchingPath(key)
+        }
+
+        if let idx = watchedFolderRecords.firstIndex(where: { $0.folderPath == normalizedPath }) {
+            let recId = watchedFolderRecords[idx].id
+            watchedFolderRecords.remove(at: idx)
+            try? database.deleteWatchedFolder(id: recId)
+        }
+    }
+
+    /// 監視対象フォルダのスキャンと差分再読み込み（低優先度バックグラウンドジョブ経由）
+    @discardableResult
+    public func scanFolderAndSyncChanges(
+        path: String,
+        projectId: UUID? = nil,
+        includeSubdirectories: Bool? = nil
+    ) async -> FolderBulkImportSummary {
+        let normalizedPath = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL.path
+        let includeSubdirs = includeSubdirectories
+            ?? watchedFolderRecords.first(where: { $0.folderPath == normalizedPath })?.includeSubdirectories
+            ?? true
+        return await importFolderInBackground(
+            path: normalizedPath,
+            projectId: projectId,
+            includeSubdirectories: includeSubdirs
+        )
+    }
+
+    // MARK: - Internal Folder Enumeration & File Watcher Implementation
+
+    private func performFolderScanAndSync(
+        normalizedFolderPath: String,
+        projectId: UUID?,
+        includeSubdirectories: Bool
+    ) async -> FolderBulkImportSummary {
+        let startTime = CFAbsoluteTimeGetCurrent()
+        let folderURL = URL(fileURLWithPath: normalizedFolderPath, isDirectory: true)
+        let candidateURLs = Self.collectRegularFileURLs(in: folderURL, includeSubdirectories: includeSubdirectories)
+
+        var scannedCount = 0
+        var newlyImported = 0
+        var textImported = 0
+        var imageImported = 0
+        var updatedReloaded = 0
+        var unchangedSkipped = 0
+        var unsupportedSkipped = 0
+        var seenFilePaths: Set<String> = []
+
+        for fileURL in candidateURLs {
+            scannedCount += 1
+            let standardizedFilePath = fileURL.standardizedFileURL.path
+            seenFilePaths.insert(standardizedFilePath)
+
+            let fileType = Self.detectFileType(for: fileURL)
+            // 要件: まずはテキストファイルと画像ファイルのみを対象とし、PDFやOffice文書等はスキップする
+            guard fileType.isSupportedInFolderBulkImport else {
+                unsupportedSkipped += 1
+                continue
+            }
+
+            // 低優先度バックグラウンド処理として、UIやリアルタイム録音/STTを阻害しないよう適宜タスクを譲る
+            await Task.yield()
+            if jobManager.hasCriticalRealtimeJobRunning {
+                try? await Task.sleep(for: .milliseconds(25))
+            }
+
+            let extractedText = Self.extractText(from: fileURL, fileType: fileType)
+            let hash = Self.computeFileAndContentHash(extractedText: extractedText, fileURL: fileURL)
+            let sizeBytes = (try? FileManager.default.attributesOfItem(atPath: standardizedFilePath)[.size] as? Int64)
+                ?? Int64(extractedText.utf8.count)
+
+            if let existingIdx = documents.firstIndex(where: {
+                URL(fileURLWithPath: $0.originalPath).standardizedFileURL.path == standardizedFilePath ||
+                URL(fileURLWithPath: $0.filePath).standardizedFileURL.path == standardizedFilePath
+            }) {
+                // ファイルが更新され内容ハッシュが変化していた場合のみ自動再読み込み＆差分インデックス更新を実行
+                if documents[existingIdx].contentHash != hash {
+                    documents[existingIdx].extractedText = extractedText
+                    documents[existingIdx].contentHash = hash
+                    documents[existingIdx].fileSizeBytes = sizeBytes
+                    documents[existingIdx].summary = Self.buildLightweightSummary(from: extractedText)
+                    documents[existingIdx].updatedAt = Date()
+                    try? database.saveDocument(documents[existingIdx])
+
+                    let pids = projectService.projectIds(forDocument: documents[existingIdx].id)
+                    _ = try? embeddingService.indexDocument(documents[existingIdx], projectIds: pids)
+                    updatedReloaded += 1
+                } else {
+                    unchangedSkipped += 1
+                }
+            } else {
+                // 新規テキスト・画像ファイルの取り込み（外部参照モード `.referencedInPlace` で重複ファイルコピーを避ける §4.2）
+                let pids = projectId.map { [$0] } ?? []
+                if let newDoc = try? await registerExternalDocumentLightweight(
+                    fileURL: fileURL,
+                    fileType: fileType,
+                    extractedText: extractedText,
+                    contentHash: hash,
+                    fileSizeBytes: sizeBytes,
+                    initialProjectIds: pids
+                ) {
+                    newlyImported += 1
+                    if fileType.isImageFile {
+                        imageImported += 1
+                    } else {
+                        textImported += 1
+                    }
+                    _ = newDoc
+                }
+            }
+
+            // 個別ファイルの in-place 編集も即時検知できるようファイルウォッチャーを設定
+            installSinglePathWatcher(
+                targetPath: standardizedFilePath,
+                rootFolderPath: normalizedFolderPath,
+                projectId: projectId,
+                includeSubdirectories: includeSubdirectories
+            )
+        }
+
+        // フォルダ配下の既存外部ドキュメントで、元ファイルが削除・移動されて参照不能になったものを検知 (§4.2)
+        var inaccessibleCount = 0
+        for doc in documents where doc.storageMode == .referencedInPlace {
+            let stdOrig = URL(fileURLWithPath: doc.originalPath).standardizedFileURL.path
+            if stdOrig.hasPrefix(normalizedFolderPath + "/") && !FileManager.default.fileExists(atPath: stdOrig) {
+                if var contentRec = try? embeddingService.documentRepository.fetchDocumentContent(documentId: doc.id.uuidString),
+                   contentRec.isSourceAccessible {
+                    contentRec.isSourceAccessible = false
+                    contentRec.updatedAt = Date()
+                    try? embeddingService.documentRepository.upsertDocumentContent(contentRec)
+                    inaccessibleCount += 1
+                }
+            }
+        }
+
+        // サブディレクトリが増えている場合もウォッチャーを補完
+        installFileSystemWatchers(
+            forFolderPath: normalizedFolderPath,
+            projectId: projectId,
+            includeSubdirectories: includeSubdirectories
+        )
+
+        let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000.0
+        let summary = FolderBulkImportSummary(
+            folderPath: normalizedFolderPath,
+            scannedFileCount: scannedCount,
+            newlyImportedCount: newlyImported,
+            textImportedCount: textImported,
+            imageImportedCount: imageImported,
+            updatedReloadedCount: updatedReloaded,
+            unchangedSkippedCount: unchangedSkipped,
+            unsupportedSkippedCount: unsupportedSkipped,
+            inaccessibleMarkedCount: inaccessibleCount,
+            durationMs: elapsedMs
+        )
+
+        if let rIdx = watchedFolderRecords.firstIndex(where: { $0.folderPath == normalizedFolderPath }) {
+            let docsInFolder = documents.filter {
+                URL(fileURLWithPath: $0.originalPath).standardizedFileURL.path.hasPrefix(normalizedFolderPath + "/")
+            }
+            watchedFolderRecords[rIdx].importedDocumentCount = docsInFolder.count
+            watchedFolderRecords[rIdx].textDocumentCount = docsInFolder.filter { $0.fileType.isTextFile }.count
+            watchedFolderRecords[rIdx].imageDocumentCount = docsInFolder.filter { $0.fileType.isImageFile }.count
+            watchedFolderRecords[rIdx].skippedUnsupportedCount = unsupportedSkipped
+            watchedFolderRecords[rIdx].lastScannedAt = Date()
+            watchedFolderRecords[rIdx].lastStatusSummary = summary.statusSummaryText
+            try? database.saveWatchedFolder(watchedFolderRecords[rIdx])
+        }
+
+        return summary
+    }
+
+    /// フォルダ一括読み込み時の軽量外部ドキュメント登録（大型LLMを起動せずバックグラウンドで高速インデックス化）
+    private func registerExternalDocumentLightweight(
+        fileURL: URL,
+        fileType: DocumentFileType,
+        extractedText: String,
+        contentHash: String,
+        fileSizeBytes: Int64,
+        initialProjectIds: [UUID]
+    ) async throws -> Document {
+        let stdPath = fileURL.standardizedFileURL.path
+        var document = Document(
+            fileName: fileURL.lastPathComponent,
+            filePath: stdPath,
+            originalPath: stdPath,
+            storageMode: .referencedInPlace,
+            fileType: fileType,
+            fileSizeBytes: fileSizeBytes,
+            contentHash: contentHash,
+            extractedText: extractedText
+        )
+
+        let config = modelManager.resolveConfiguration()
+        let judge = SystemOneJudgeAdapter(model: config.judgeModel)
+        let judgeOutput = judge.classifyDocument(
+            fileName: document.fileName,
+            content: document.extractedText,
+            projects: projectService.projects,
+            vocabularies: projectService.vocabularies
+        )
+
+        var matchedProjects = Set(initialProjectIds)
+        for (pid, score) in judgeOutput.projectRelevanceScores where score >= 0.35 {
+            matchedProjects.insert(pid)
+        }
+
+        var tags = judgeOutput.suggestedTags
+        if fileType == .image {
+            tags = Array(Set(tags + ["画像OCR"])).sorted()
+        }
+
+        document.category = judgeOutput.category
+        document.tags = tags
+        document.summary = Self.buildLightweightSummary(from: extractedText)
+        document.classificationStage = fileType == .image
+            ? "Vision OCR + 軽量判断モデル (\(config.judgeModel.name))"
+            : "フォルダ一括取込 + 軽量判断モデル (\(config.judgeModel.name))"
+        document.relatedDocumentIds = findRelatedDocumentIds(for: document)
+
+        documents.insert(document, at: 0)
+        try database.saveDocument(document)
+
+        let finalPids = Array(matchedProjects)
+        for pid in finalPids {
+            try projectService.associateDocument(
+                documentId: document.id,
+                projectId: pid,
+                relevanceScore: 0.9,
+                isSuggestedByAI: !initialProjectIds.contains(pid),
+                isApproved: initialProjectIds.contains(pid)
+            )
+        }
+        try embeddingService.indexDocument(document, projectIds: finalPids)
+        return document
+    }
+
+    private func installFileSystemWatchers(
+        forFolderPath folderPath: String,
+        projectId: UUID?,
+        includeSubdirectories: Bool
+    ) {
+        installSinglePathWatcher(
+            targetPath: folderPath,
+            rootFolderPath: folderPath,
+            projectId: projectId,
+            includeSubdirectories: includeSubdirectories
+        )
+
+        guard includeSubdirectories else { return }
+        let rootURL = URL(fileURLWithPath: folderPath, isDirectory: true)
+        guard let enumerator = FileManager.default.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else { return }
+
+        var watchedDirCount = 0
+        for case let itemURL as URL in enumerator {
+            guard watchedDirCount < 64 else { break }
+            if (try? itemURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+                let dirPath = itemURL.standardizedFileURL.path
+                installSinglePathWatcher(
+                    targetPath: dirPath,
+                    rootFolderPath: folderPath,
+                    projectId: projectId,
+                    includeSubdirectories: includeSubdirectories
+                )
+                watchedDirCount += 1
+            }
+        }
+    }
+
+    private func installSinglePathWatcher(
+        targetPath: String,
+        rootFolderPath: String,
+        projectId: UUID?,
+        includeSubdirectories: Bool
+    ) {
+        // 既にウォッチャーが稼働中ならスキップ（合計ディスクリプタ数上限 192 で保護）
+        guard directoryAndFileWatchers[targetPath] == nil,
+              directoryAndFileWatchers.count < 192 else { return }
+
+        let fd = open(targetPath, O_EVTONLY)
         guard fd >= 0 else { return }
+
         let source = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: fd,
-            eventMask: [.write, .extend, .rename],
+            eventMask: [.write, .extend, .attrib, .link, .rename, .delete],
             queue: .main
         )
         source.setEventHandler { [weak self] in
             guard let self else { return }
+            let flags = source.data
             Task { @MainActor in
-                await self.scanFolderAndSyncChanges(path: path, projectId: projectId)
+                // エディタによる atomic save (.rename / .delete) の場合はウォッチャーを張り直す
+                if flags.contains(.rename) || flags.contains(.delete) {
+                    self.stopWatchingPath(targetPath)
+                    if FileManager.default.fileExists(atPath: targetPath) {
+                        self.installSinglePathWatcher(
+                            targetPath: targetPath,
+                            rootFolderPath: rootFolderPath,
+                            projectId: projectId,
+                            includeSubdirectories: includeSubdirectories
+                        )
+                    }
+                }
+                self.scheduleDebouncedFolderSync(
+                    folderPath: rootFolderPath,
+                    projectId: projectId,
+                    includeSubdirectories: includeSubdirectories
+                )
             }
         }
         source.setCancelHandler {
             close(fd)
         }
         source.resume()
-        folderWatchers[path] = source
+        directoryAndFileWatchers[targetPath] = source
     }
 
-    public func scanFolderAndSyncChanges(path: String, projectId: UUID? = nil) async {
-        let folderURL = URL(fileURLWithPath: path, isDirectory: true)
-        guard let urls = try? FileManager.default.contentsOfDirectory(
-            at: folderURL,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else { return }
-
-        for fileURL in urls {
-            let fileType = Self.detectFileType(for: fileURL)
-            guard fileType != .other else { continue }
-            let text = Self.extractText(from: fileURL, fileType: fileType)
-            let hash = Self.sha256Hex(of: text)
-
-            if let existingIdx = documents.firstIndex(where: { $0.originalPath == fileURL.path || $0.filePath == fileURL.path }) {
-                // 内容ハッシュが変化していた場合のみ差分更新・Embedding再生成を行う
-                if documents[existingIdx].contentHash != hash {
-                    documents[existingIdx].extractedText = text
-                    documents[existingIdx].contentHash = hash
-                    documents[existingIdx].updatedAt = Date()
-                    try? database.saveDocument(documents[existingIdx])
-                    let pids = projectService.projectIds(forDocument: documents[existingIdx].id)
-                    _ = try? embeddingService.indexDocument(documents[existingIdx], projectIds: pids)
-                }
-            } else {
-                let pids = projectId.map { [$0] } ?? []
-                _ = try? await registerFile(
-                    url: fileURL,
-                    storageMode: .referencedInPlace,
-                    explicitContent: text,
-                    initialProjectIds: pids
-                )
-            }
+    private func stopWatchingPath(_ path: String) {
+        if let src = directoryAndFileWatchers.removeValue(forKey: path) {
+            src.cancel()
         }
     }
 
-    // MARK: - Helpers
+    private func scheduleDebouncedFolderSync(
+        folderPath: String,
+        projectId: UUID?,
+        includeSubdirectories: Bool
+    ) {
+        debouncedFolderSyncTasks[folderPath]?.cancel()
+        debouncedFolderSyncTasks[folderPath] = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(120))
+            guard let self, !Task.isCancelled else { return }
+            _ = await self.importFolderInBackground(
+                path: folderPath,
+                projectId: projectId,
+                includeSubdirectories: includeSubdirectories
+            )
+        }
+    }
+
+    // MARK: - Helpers (ファイル種別判定・テキスト抽出・Apple Vision 画像OCR)
+
+    private static func collectRegularFileURLs(in folderURL: URL, includeSubdirectories: Bool) -> [URL] {
+        guard FileManager.default.fileExists(atPath: folderURL.path) else { return [] }
+        if !includeSubdirectories {
+            let urls = (try? FileManager.default.contentsOfDirectory(
+                at: folderURL,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            )) ?? []
+            return urls.filter { (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true }
+                .sorted { $0.path < $1.path }
+        }
+
+        guard let enumerator = FileManager.default.enumerator(
+            at: folderURL,
+            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else { return [] }
+
+        let ignoredDirNames: Set<String> = ["node_modules", ".git", ".build", "DerivedData", "__pycache__"]
+        var files: [URL] = []
+        for case let itemURL as URL in enumerator {
+            let name = itemURL.lastPathComponent
+            if ignoredDirNames.contains(name) {
+                enumerator.skipDescendants()
+                continue
+            }
+            if (try? itemURL.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+                files.append(itemURL)
+            }
+        }
+        return files.sorted { $0.path < $1.path }
+    }
 
     private func findRelatedDocumentIds(for document: Document) -> [UUID] {
         let embModel = modelManager.model(withId: modelManager.globalSettings.embeddingModelId)
@@ -476,26 +916,142 @@ public final class DocumentService {
 
     public static func detectFileType(for url: URL) -> DocumentFileType {
         switch url.pathExtension.lowercased() {
-        case "txt", "log": .txt
-        case "md", "markdown": .markdown
-        case "pdf": .pdf
-        case "json": .json
-        case "swift", "py", "ts", "tsx", "js", "rs", "go", "c", "cpp", "h", "yaml", "yml", "toml": .sourceCode
-        default: .other
+        case "txt", "log", "csv", "tsv", "rtf":
+            .txt
+        case "md", "markdown", "mdx":
+            .markdown
+        case "json", "jsonl":
+            .json
+        case "swift", "py", "ts", "tsx", "js", "jsx", "rs", "go", "c", "cpp", "h", "hpp", "yaml", "yml", "toml", "xml", "html", "css", "sh", "zsh", "sql":
+            .sourceCode
+        case "png", "jpg", "jpeg", "heic", "webp", "tiff", "tif", "bmp", "gif":
+            .image
+        case "pdf":
+            .pdf
+        case "doc", "docx", "xls", "xlsx", "ppt", "pptx":
+            .officeDocument
+        default:
+            .other
         }
     }
 
     public static func extractText(from url: URL, fileType: DocumentFileType) -> String {
         guard FileManager.default.fileExists(atPath: url.path) else { return "" }
+
+        if fileType == .image {
+            return extractTextFromImageUsingVision(at: url)
+        }
+
         if fileType == .pdf {
             if let pdf = PDFDocument(url: url), let pdfText = pdf.string, !pdfText.isEmpty {
                 return pdfText
             }
         }
-        if let str = try? String(contentsOf: url, encoding: .utf8) {
-            return str
+
+        // テキストファイルの読み込み（UTF-8 → Shift-JIS → EUC-JP → ISO-8859-1 の順にフォールバック）
+        for encoding: String.Encoding in [.utf8, .shiftJIS, .japaneseEUC, .isoLatin1] {
+            if let str = try? String(contentsOf: url, encoding: encoding), !str.isEmpty {
+                return str
+            }
         }
         return ""
+    }
+
+    /// Apple Vision (`VNRecognizeTextRequest`) を用いた画像ファイルのオンデバイスOCRテキスト抽出（日本語・英語対応）
+    public static func extractTextFromImageUsingVision(at url: URL) -> String {
+        var recognizedLines: [(minY: CGFloat, minX: CGFloat, text: String)] = []
+
+        let request = VNRecognizeTextRequest { req, _ in
+            guard let observations = req.results as? [VNRecognizedTextObservation] else { return }
+            for obs in observations {
+                if let candidate = obs.topCandidates(1).first {
+                    let trimmed = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        recognizedLines.append((obs.boundingBox.minY, obs.boundingBox.minX, trimmed))
+                    }
+                }
+            }
+        }
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = true
+        request.recognitionLanguages = ["ja-JP", "en-US"]
+
+        if let image = NSImage(contentsOf: url),
+           let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+            try? handler.perform([request])
+        } else {
+            let handler = VNImageRequestHandler(url: url, options: [:])
+            try? handler.perform([request])
+        }
+
+        // Vision の座標系は左下が (0,0) のため、上から下（minY の降順）→ 左から右（minX の昇順）に整列する
+        let ordered = recognizedLines.sorted { a, b in
+            if abs(a.minY - b.minY) > 0.025 {
+                return a.minY > b.minY
+            }
+            return a.minX < b.minX
+        }.map(\.text)
+
+        if !ordered.isEmpty {
+            return ordered.joined(separator: "\n")
+        }
+
+        // 文字が含まれない画像（図形・アイコンのみ等）の場合もファイル名と解像度メタデータを保持する
+        if let img = NSImage(contentsOf: url) {
+            let w = Int(img.size.width)
+            let h = Int(img.size.height)
+            return "[画像ファイル: \(url.lastPathComponent) (\(w)x\(h))]"
+        }
+        return "[画像ファイル: \(url.lastPathComponent)]"
+    }
+
+    /// テストおよびプレビュー生成用：指定したテキストを描画したPNG画像ファイルを生成する
+    @discardableResult
+    public static func renderTextToPNGImageFile(
+        lines: [String],
+        to destinationURL: URL,
+        size: NSSize = NSSize(width: 960, height: 360)
+    ) throws -> URL {
+        guard let bitmapRep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: Int(size.width),
+            pixelsHigh: Int(size.height),
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .calibratedRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else {
+            throw NSError(domain: "DocumentService", code: 500, userInfo: [NSLocalizedDescriptionKey: "Failed to create bitmap representation"])
+        }
+
+        NSGraphicsContext.saveGraphicsState()
+        if let ctx = NSGraphicsContext(bitmapImageRep: bitmapRep) {
+            NSGraphicsContext.current = ctx
+            NSColor.white.setFill()
+            NSBezierPath(rect: NSRect(origin: .zero, size: size)).fill()
+
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.boldSystemFont(ofSize: 32),
+                .foregroundColor: NSColor.black
+            ]
+            var yCursor = size.height - 68
+            for line in lines {
+                let nsStr = line as NSString
+                nsStr.draw(at: NSPoint(x: 36, y: yCursor), withAttributes: attrs)
+                yCursor -= 56
+            }
+            ctx.flushGraphics()
+        }
+        NSGraphicsContext.restoreGraphicsState()
+
+        if let pngData = bitmapRep.representation(using: .png, properties: [:]) {
+            try pngData.write(to: destinationURL, options: .atomic)
+        }
+        return destinationURL
     }
 
     public static func buildLightweightSummary(from text: String) -> String {
@@ -511,5 +1067,19 @@ public final class DocumentService {
     public static func sha256Hex(of text: String) -> String {
         let digest = SHA256.hash(data: Data(text.utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// 抽出テキストのハッシュに加え、実ファイルがある場合はバイナリのSHA-256も組み合わせて画像変更等を確実に検知する
+    public static func computeFileAndContentHash(extractedText: String, fileURL: URL?) -> String {
+        if let fileURL,
+           let fileData = try? Data(contentsOf: fileURL),
+           !fileData.isEmpty {
+            var hasher = SHA256()
+            hasher.update(data: Data(extractedText.utf8))
+            hasher.update(data: fileData)
+            let digest = hasher.finalize()
+            return digest.map { String(format: "%02x", $0) }.joined()
+        }
+        return sha256Hex(of: extractedText)
     }
 }

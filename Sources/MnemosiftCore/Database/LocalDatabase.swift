@@ -665,4 +665,21 @@ public final class LocalDatabase: @unchecked Sendable {
     public func loadBenchmarkRecords() throws -> [BenchmarkMetricRecord] {
         try fetchEntities(type: "BenchmarkMetricRecord")
     }
+
+    // 16. WatchedFolderRecord
+    public func saveWatchedFolder(_ record: WatchedFolderRecord) throws {
+        try upsertEntity(
+            type: "WatchedFolderRecord",
+            id: record.id.uuidString,
+            parentId: record.projectId?.uuidString,
+            updatedAt: record.lastScannedAt ?? record.createdAt,
+            value: record
+        )
+    }
+    public func loadWatchedFolders() throws -> [WatchedFolderRecord] {
+        try fetchEntities(type: "WatchedFolderRecord", ascending: true)
+    }
+    public func deleteWatchedFolder(id: UUID) throws {
+        try deleteEntity(type: "WatchedFolderRecord", id: id.uuidString)
+    }
 }

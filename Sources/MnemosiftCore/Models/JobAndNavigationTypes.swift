@@ -7,6 +7,7 @@ public enum JobType: String, Codable, CaseIterable, Sendable {
     case meetingMinutesGeneration = "議事録生成"
     case documentParsing = "ファイル解析"
     case documentClassification = "ファイル分類"
+    case folderBulkImport = "フォルダ一括読み込み・自動同期"
     case embeddingGeneration = "Embedding生成"
     case vocabularyExtraction = "専門用語候補抽出"
     case modelDownload = "モデルダウンロード"

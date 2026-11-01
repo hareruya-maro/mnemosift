@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import UniformTypeIdentifiers
 import MnemosiftCore
 
@@ -69,9 +70,9 @@ public struct FilesView: View {
                 Image(systemName: "arrow.down.doc.fill")
                     .font(.title2)
                     .foregroundStyle(isDropTargeted ? .blue : .secondary)
-                Text("ここにTXT / MD / PDF / JSON / コードをドロップ")
+                Text("ここにTXT / MD / 画像(PNG/JPG等・OCR) / フォルダをドロップ")
                     .font(.caption.bold())
-                Text("または下のフォームから即座に登録・段階的AI分類を実行")
+                Text("または下のフォーム・フォルダ指定から即座に登録・段階的AI分類を実行")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -108,35 +109,93 @@ public struct FilesView: View {
 
     private var folderMonitoringBox: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("フォルダ監視・自動分類 (Phase 4)")
-                .font(.subheadline.bold())
-
             HStack {
-                TextField("監視対象フォルダパス", text: $watchedFolderPathInput)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.caption)
-                Button("監視追加", systemImage: "eye") {
-                    guard !watchedFolderPathInput.isEmpty else { return }
-                    workspace.documentService.startMonitoringFolder(
-                        path: watchedFolderPathInput,
-                        projectId: workspace.selectedProjectId
-                    )
+                Text("フォルダ指定一括読み込み・自動再読み込み")
+                    .font(.subheadline.bold())
+                Spacer()
+                if workspace.documentService.isFolderSyncRunning {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+
+            Text("対象: テキストファイル＆画像ファイル(Apple Vision OCR) / 優先度低バックグラウンド実行")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            Button("フォルダを選択して一括読み込み...", systemImage: "folder.fill.badge.plus") {
+                let panel = NSOpenPanel()
+                panel.title = "一括読み込み・自動監視するフォルダを選択（テキスト・画像OCR対象）"
+                panel.canChooseFiles = false
+                panel.canChooseDirectories = true
+                panel.allowsMultipleSelection = false
+                if panel.runModal() == .OK, let folderURL = panel.url {
                     Task {
-                        await workspace.documentService.scanFolderAndSyncChanges(
-                            path: watchedFolderPathInput,
+                        let summary = await workspace.documentService.importFolderInBackground(
+                            path: folderURL.path,
                             projectId: workspace.selectedProjectId
                         )
+                        workspace.statusBannerMessage = "📁 \(summary.statusSummaryText)"
                     }
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+
+            HStack {
+                TextField("監視対象フォルダパスを直接入力", text: $watchedFolderPathInput)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                Button("読込＆監視追加", systemImage: "eye") {
+                    let path = watchedFolderPathInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !path.isEmpty else { return }
                     watchedFolderPathInput = ""
+                    Task {
+                        let summary = await workspace.documentService.importFolderInBackground(
+                            path: path,
+                            projectId: workspace.selectedProjectId
+                        )
+                        workspace.statusBannerMessage = "📁 \(summary.statusSummaryText)"
+                    }
                 }
                 .controlSize(.small)
             }
 
-            if !workspace.documentService.watchedFolders.isEmpty {
-                ForEach(workspace.documentService.watchedFolders, id: \.self) { folder in
-                    Text("監視中: \(folder)")
-                        .font(.caption2)
-                        .foregroundStyle(.green)
+            if let summary = workspace.documentService.lastFolderImportSummary {
+                Text("直近結果: \(summary.statusSummaryText)")
+                    .font(.caption2)
+                    .foregroundStyle(.blue)
+            }
+
+            if !workspace.documentService.watchedFolderRecords.isEmpty {
+                ForEach(workspace.documentService.watchedFolderRecords) { record in
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("監視中: \(record.folderPath)")
+                                .font(.caption2.bold())
+                                .foregroundStyle(.green)
+                                .lineLimit(1)
+                            Text("読込 \(record.importedDocumentCount)件 (Text \(record.textDocumentCount) / 画像OCR \(record.imageDocumentCount) / 対象外 \(record.skippedUnsupportedCount))")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("再同期") {
+                            Task {
+                                let summary = await workspace.documentService.importFolderInBackground(
+                                    path: record.folderPath,
+                                    projectId: record.projectId ?? workspace.selectedProjectId,
+                                    includeSubdirectories: record.includeSubdirectories
+                                )
+                                workspace.statusBannerMessage = "📁 \(summary.statusSummaryText)"
+                            }
+                        }
+                        .controlSize(.mini)
+                        Button("解除", role: .destructive) {
+                            workspace.documentService.stopMonitoringFolder(path: record.folderPath)
+                        }
+                        .controlSize(.mini)
+                    }
                 }
             }
         }
@@ -371,13 +430,22 @@ public struct FilesView: View {
                 guard let data = item as? Data,
                       let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
                 Task { @MainActor in
-                    let pids = workspace.selectedProjectId.map { [$0] } ?? []
-                    if let doc = try? await workspace.documentService.registerFile(
-                        url: url,
-                        storageMode: selectedStorageMode,
-                        initialProjectIds: pids
-                    ) {
-                        workspace.selectedDocumentId = doc.id
+                    var isDir: ObjCBool = false
+                    if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+                        let summary = await workspace.documentService.importFolderInBackground(
+                            path: url.path,
+                            projectId: workspace.selectedProjectId
+                        )
+                        workspace.statusBannerMessage = "📁 \(summary.statusSummaryText)"
+                    } else {
+                        let pids = workspace.selectedProjectId.map { [$0] } ?? []
+                        if let doc = try? await workspace.documentService.registerFile(
+                            url: url,
+                            storageMode: selectedStorageMode,
+                            initialProjectIds: pids
+                        ) {
+                            workspace.selectedDocumentId = doc.id
+                        }
                     }
                 }
             }

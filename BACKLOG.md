@@ -40,9 +40,13 @@
 
 ## 3. 資料解析・出力フォーマット拡張
 
-### - [ ] Office文書（Word / Excel / PowerPoint）および画像OCR解析対応
+### - [x] テキストファイル・画像ファイル（Apple Vision OCR）のフォルダ一括読み込み・自動再読み込み対応
+- **優先度**: 高
+- **概要**: 指定フォルダ配下のテキスト系ファイル（`.txt`, `.md`, `.csv`, `.json`, ソースコード等）と画像ファイル（`.png`, `.jpg`, `.heic`, `.webp` 等 — Apple Vision `VNRecognizeTextRequest` によるオンデバイスOCR）を優先度低（`.lowBackground`）のバックグラウンドジョブとして一括読み込みし、`DispatchSourceFileSystemObject` によりファイル更新時の自動再読み込み・差分インデックス更新を実行。
+
+### - [ ] PDF および Microsoft Office文書（Word / Excel / PowerPoint）の一括読み込み対応
 - **優先度**: 中
-- **概要**: PDF / Markdown / TXT / コードに加え、Officeドキュメントやスクリーンショット画像内のテキスト（Apple Vision `VNRecognizeTextRequest` によるオンデバイスOCR）をローカル検索インデックスへ取り込む（仕様書 §7.2 後続フェーズ項目）。
+- **概要**: フォルダ一括読み込み・自動監視の対象を、PDF および Microsoft Office ドキュメント形式（`.docx`, `.xlsx`, `.pptx`）へ拡張する。
 
 ### - [ ] 議事録の PDF / JSON エクスポート対応
 - **優先度**: 低
@@ -83,9 +87,9 @@
   - `documents`, `document_contents`, `document_chunks`, `search_units`, `search_units_fts` (External Content FTS5), `embeddings` の分離スキーマ実装。
   - 文書要約とチャンクの2階層 Embedding（384次元等、モデルから動的取得）、Apple `NaturalLanguage` 形態素解析、意味保護（否定・決定状態・形容詞比較・数値単位）、BM25列重み付け全文検索、Cosineベクター検索、RRF (`k=60`) ドキュメント単位統合ランキング、差分インデックス更新、52件の検索品質評価スイートを実装。
 
-### - [ ] 端末内のその他のドキュメントの自動読み込み・外部ファイル連携処理
+### - [x] 端末内のその他のドキュメントの自動読み込み・外部ファイル連携処理（Phase 1: テキスト・画像OCR）
 - **優先度**: 高
-- **概要**: アプリ内で明示登録した文書以外にも、端末内の指定ディレクトリや外部ドキュメントを安全にスキャン・キャッシュ・差分インデックス化する読み込み処理（後日実装予定）。
+- **概要**: 指定フォルダの一括読み込み（テキスト・画像Vision OCR対象、外部参照モードで重複保存なし）、ファイル更新時の `DispatchSourceFileSystemObject` 自動再読み込み・差分インデックス更新、優先度低（`.lowBackground`）のバックグラウンド処理を実装完了。PDF・Microsoft Office文書は次フェーズで拡張。
 
 ### - [ ] 検索基盤の将来拡張（仕様書 §2.2）
 - **優先度**: 中

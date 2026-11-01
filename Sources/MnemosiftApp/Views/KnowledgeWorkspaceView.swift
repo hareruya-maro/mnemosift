@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import UniformTypeIdentifiers
 import MnemosiftCore
 
@@ -19,8 +20,11 @@ public struct KnowledgeWorkspaceView: View {
     @State private var searchScope: SearchScopeMode = .projectPriority
     @State private var selectedCategory: KnowledgeCategoryTab = .all
     @State private var isShowingAddDocumentPopover: Bool = false
+    @State private var isShowingFolderImportPopover: Bool = false
     @State private var isShowingAddVocabPopover: Bool = false
     @State private var isDropTargeted: Bool = false
+    @State private var customFolderPathInput: String = ""
+    @State private var includeSubdirectoriesForImport: Bool = true
 
     // 新規資料追加用
     @State private var newDocTitle: String = "新規設計メモ.md"
@@ -130,6 +134,15 @@ public struct KnowledgeWorkspaceView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+
+                Button("📁 フォルダ一括読込", systemImage: "folder.badge.plus") {
+                    isShowingFolderImportPopover = true
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .popover(isPresented: $isShowingFolderImportPopover) {
+                    folderBulkImportPopoverContent
+                }
 
                 Button("＋ 資料を追加", systemImage: "doc.badge.plus") {
                     isShowingAddDocumentPopover = true
@@ -589,10 +602,28 @@ public struct KnowledgeWorkspaceView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     ScrollView {
-                        Text(doc.extractedText)
-                            .font(.system(.callout, design: .monospaced))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .textSelection(.enabled)
+                        VStack(alignment: .leading, spacing: 12) {
+                            if doc.fileType == .image,
+                               let nsImage = NSImage(contentsOfFile: doc.filePath) {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("🖼️ 元画像プレビュー（Apple Vision OCR による自動テキスト抽出済み）")
+                                        .font(.caption.bold())
+                                        .foregroundStyle(.secondary)
+                                    Image(nsImage: nsImage)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .frame(maxHeight: 200)
+                                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                                }
+                                .padding(8)
+                                .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                            }
+
+                            Text(doc.extractedText)
+                                .font(.system(.callout, design: .monospaced))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .textSelection(.enabled)
+                        }
                     }
                 }
             }
@@ -749,6 +780,125 @@ public struct KnowledgeWorkspaceView: View {
         .padding(16)
     }
 
+    private var folderBulkImportPopoverContent: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label("フォルダ指定一括読み込み・自動再読み込み監視", systemImage: "folder.badge.gearshape")
+                    .font(.headline)
+                Spacer()
+                if workspace.documentService.isFolderSyncRunning {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+
+            Text("対象ファイル: テキストファイル (.txt / .md / .csv / .json / コード等) および画像ファイル (.png / .jpg / .heic / .webp等 — Apple Vision OCR自動抽出)\n※PDF・Microsoft Office文書は今後のアップデートで順次対応予定（現在は自動スキップ）\n※優先度低（バックグラウンド処理）で実行され、ファイル更新時は自動再読み込み＆差分インデックス更新を行います。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            Toggle("サブフォルダ内のファイルも再帰的に読み込む", isOn: $includeSubdirectoriesForImport)
+                .font(.caption)
+
+            HStack(spacing: 8) {
+                Button("フォルダを選択して一括読み込み...", systemImage: "folder.fill.badge.plus") {
+                    selectFolderWithOpenPanel()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+
+                TextField("またはフォルダパスを直接入力", text: $customFolderPathInput)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+
+                Button("パス読込") {
+                    let path = customFolderPathInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !path.isEmpty else { return }
+                    customFolderPathInput = ""
+                    Task {
+                        let summary = await workspace.documentService.importFolderInBackground(
+                            path: path,
+                            projectId: workspace.selectedProjectId,
+                            includeSubdirectories: includeSubdirectoriesForImport
+                        )
+                        workspace.statusBannerMessage = "📁 \(summary.statusSummaryText)"
+                        workspace.refreshMeetingPartnerState()
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+
+            if let summary = workspace.documentService.lastFolderImportSummary {
+                Text("直近の同期結果: \(summary.statusSummaryText) (\(String(format: "%.0fms", summary.elapsedMs)))")
+                    .font(.caption2.bold())
+                    .foregroundStyle(.blue)
+            }
+
+            if !workspace.documentService.watchedFolderRecords.isEmpty {
+                Divider()
+                Text("監視中フォルダ一覧（ファイル更新時に自動再読み込み）")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+
+                ForEach(workspace.documentService.watchedFolderRecords) { record in
+                    HStack(spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(record.folderPath)
+                                .font(.caption.bold())
+                                .lineLimit(1)
+                            Text("読込済 \(record.importedDocumentCount)件 (Text \(record.textDocumentCount) / 画像OCR \(record.imageDocumentCount) / 対象外スキップ \(record.skippedUnsupportedCount)) ・ \(record.lastSyncStatusMessage)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("再スキャン", systemImage: "arrow.clockwise") {
+                            Task {
+                                let summary = await workspace.documentService.importFolderInBackground(
+                                    path: record.folderPath,
+                                    projectId: record.projectId ?? workspace.selectedProjectId,
+                                    includeSubdirectories: record.includeSubdirectories
+                                )
+                                workspace.statusBannerMessage = "📁 \(summary.statusSummaryText)"
+                            }
+                        }
+                        .controlSize(.mini)
+                        .buttonStyle(.bordered)
+
+                        Button("解除", role: .destructive) {
+                            workspace.documentService.stopMonitoringFolder(path: record.folderPath)
+                        }
+                        .controlSize(.mini)
+                        .buttonStyle(.bordered)
+                    }
+                    .padding(6)
+                    .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                }
+            }
+        }
+        .padding(16)
+        .frame(width: 540)
+    }
+
+    private func selectFolderWithOpenPanel() {
+        let panel = NSOpenPanel()
+        panel.title = "一括読み込み・自動監視するフォルダを選択（テキスト・画像OCR対象）"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let folderURL = panel.url {
+            let includeSub = includeSubdirectoriesForImport
+            Task {
+                let summary = await workspace.documentService.importFolderInBackground(
+                    path: folderURL.path,
+                    projectId: workspace.selectedProjectId,
+                    includeSubdirectories: includeSub
+                )
+                workspace.statusBannerMessage = "📁 \(summary.statusSummaryText)"
+                workspace.refreshMeetingPartnerState()
+            }
+        }
+    }
+
     private var addVocabularyPopoverContent: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("専門用語の手動登録")
@@ -847,14 +997,25 @@ public struct KnowledgeWorkspaceView: View {
                 guard let data = item as? Data,
                       let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
                 Task { @MainActor in
-                    let pids = workspace.selectedProjectId.map { [$0] } ?? []
-                    if let doc = try? await workspace.documentService.registerFile(
-                        url: url,
-                        storageMode: .referencedInPlace,
-                        initialProjectIds: pids
-                    ) {
-                        workspace.selectedDocumentId = doc.id
+                    var isDir: ObjCBool = false
+                    if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+                        let summary = await workspace.documentService.importFolderInBackground(
+                            path: url.path,
+                            projectId: workspace.selectedProjectId,
+                            includeSubdirectories: includeSubdirectoriesForImport
+                        )
+                        workspace.statusBannerMessage = "📁 \(summary.statusSummaryText)"
                         workspace.refreshMeetingPartnerState()
+                    } else {
+                        let pids = workspace.selectedProjectId.map { [$0] } ?? []
+                        if let doc = try? await workspace.documentService.registerFile(
+                            url: url,
+                            storageMode: .referencedInPlace,
+                            initialProjectIds: pids
+                        ) {
+                            workspace.selectedDocumentId = doc.id
+                            workspace.refreshMeetingPartnerState()
+                        }
                     }
                 }
             }
