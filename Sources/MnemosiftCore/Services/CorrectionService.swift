@@ -58,7 +58,7 @@ public final class CorrectionService {
         let usedModelId: String
 
         switch mode {
-        case .off:
+        case .off, .manual:
             return (segment, nil)
 
         case .dictionary:
@@ -192,6 +192,56 @@ public final class CorrectionService {
         revertedSegment.updatedAt = Date()
         try database.saveTranscriptSegment(revertedSegment)
         return revertedSegment
+    }
+
+    /// 発話セグメントに対してユーザーによる手動訂正を適用する
+    /// - STT原文 (`rawText`) は不変のまま保護し、補正後テキスト (`correctedText`) とリビジョン履歴を更新する
+    public func applyManualCorrection(
+        segment: TranscriptSegment,
+        correctedText: String
+    ) throws -> (updatedSegment: TranscriptSegment, revision: TranscriptRevision?) {
+        let trimmed = correctedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed == segment.correctedText {
+            return (segment, nil)
+        }
+
+        // 原文と完全に一致するよう編集された場合はロールバック扱いとする
+        if trimmed == segment.rawText {
+            let reverted = try revertSegmentCorrection(segment)
+            return (reverted, nil)
+        }
+
+        let revision = TranscriptRevision(
+            segmentId: segment.id,
+            transcriptId: segment.transcriptId,
+            sttRawText: segment.rawText,
+            correctedText: trimmed,
+            correctionSpans: [
+                CorrectionSpan(
+                    originalFragment: segment.correctedText,
+                    correctedFragment: trimmed,
+                    reason: "手動訂正",
+                    confidence: 1.0,
+                    vocabularyId: nil
+                )
+            ],
+            correctionMethod: .manual,
+            modelId: "manual-user-edit",
+            guardrailNotes: ["ユーザーによる手動訂正（原文保護・即時反映）"],
+            isReverted: false,
+            createdAt: Date()
+        )
+
+        var updated = segment
+        updated.correctedText = trimmed
+        updated.activeRevisionId = revision.id
+        updated.updatedAt = Date()
+
+        try database.saveTranscriptRevision(revision)
+        try database.saveTranscriptSegment(updated)
+        revisions.insert(revision, at: 0)
+
+        return (updated, revision)
     }
 
     public func revisions(for segmentId: UUID) -> [TranscriptRevision] {

@@ -229,6 +229,41 @@ public final class AppWorkspaceController {
         )
     }
 
+    /// 仕様書 §5.6: リアルタイム文字起こし結果の手動訂正を適用する
+    /// - STT原文 (`rawText`) を保護したまま補正後テキスト (`correctedText`) とリビジョンを更新
+    /// - 検索インデックスおよび会議パートナーのコンテキストも即座に再同期する
+    public func updateTranscriptSegmentText(transcriptId: UUID, segmentId: UUID, newText: String) {
+        do {
+            if let _ = try sttService.updateSegmentManualCorrection(
+                transcriptId: transcriptId,
+                segmentId: segmentId,
+                correctedText: newText
+            ) {
+                if let tr = sttService.transcripts.first(where: { $0.id == transcriptId }) {
+                    let segs = sttService.segments(for: transcriptId)
+                    try? embeddingService.indexTranscript(tr, segments: segs)
+                }
+                refreshMeetingPartnerState()
+            }
+        } catch {
+            statusBannerMessage = "文字起こしの手動訂正に失敗しました: \(error.localizedDescription)"
+        }
+    }
+
+    /// 誤補正または手動訂正を取り消してSTT原文にロールバックする
+    public func revertTranscriptSegmentCorrection(transcriptId: UUID, segmentId: UUID) {
+        do {
+            try sttService.revertCorrection(transcriptId: transcriptId, segmentId: segmentId)
+            if let tr = sttService.transcripts.first(where: { $0.id == transcriptId }) {
+                let segs = sttService.segments(for: transcriptId)
+                try? embeddingService.indexTranscript(tr, segments: segs)
+            }
+            refreshMeetingPartnerState()
+        } catch {
+            statusBannerMessage = "原文へのロールバックに失敗しました: \(error.localizedDescription)"
+        }
+    }
+
     /// 仕様書 §9.6: プロジェクト詳細画面から操作を開始した際に対象プロジェクトを初期選択して画面遷移する
     public func navigateFromProject(_ projectId: UUID, to section: NavigationSection) {
         self.selectedProjectId = projectId

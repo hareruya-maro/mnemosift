@@ -108,8 +108,20 @@ struct MnemosiftTests {
         #expect(segFast.correctedText.contains("Qwen3-ASR"))
         #expect(segFast.hasCorrection)
 
-        // 誤補正の取り消し（ロールバック）で原文に戻ること
-        try ws.sttService.revertCorrection(transcriptId: tr.id, segmentId: segFast.id)
+        // 手動訂正の検証：ユーザーがテキストを直接手動で修正した場合に反映され、rawTextは保護されること
+        let manualText = "Mnemosift上でQwen3-ASRを手動で訂正して実行します。"
+        ws.updateTranscriptSegmentText(transcriptId: tr.id, segmentId: segFast.id, newText: manualText)
+        let afterManual = try #require(ws.sttService.segments(for: tr.id).first(where: { $0.id == segFast.id }))
+        #expect(afterManual.rawText == rawInput) // 原文は保護される
+        #expect(afterManual.correctedText == manualText)
+        #expect(afterManual.hasCorrection)
+
+        let revisions = ws.correctionService.revisions(for: segFast.id)
+        #expect(revisions.first?.correctionMethod == .manual)
+        #expect(revisions.first?.correctionSpans.first?.reason == "手動訂正")
+
+        // 誤補正・手動訂正の取り消し（ロールバック）で原文に戻ること
+        ws.revertTranscriptSegmentCorrection(transcriptId: tr.id, segmentId: segFast.id)
         let afterRevert = try #require(ws.sttService.segments(for: tr.id).first(where: { $0.id == segFast.id }))
         #expect(afterRevert.correctedText == rawInput)
         #expect(!afterRevert.hasCorrection)
@@ -1613,5 +1625,85 @@ struct MnemosiftTests {
         #expect(try ws.embeddingService.documentRepository.fetchDocument(id: meeting.id.uuidString) != nil)
         let remainingHits = ws.searchService.search(query: "モバイルアプリ認証基盤検討会議", scopeMode: .global)
         #expect(remainingHits.contains(where: { $0.chunk.title == "モバイルアプリ認証基盤検討会議" }))
+    }
+
+    @Test("20. リアルタイム文字起こしの手動訂正・STT原文保護・リビジョン履歴・ロールバックの包括的検証")
+    func testManualCorrectionOfTranscriptSegments() async throws {
+        let ws = try makeIsolatedController()
+        let rec = try ws.recordingService.startRecording(
+            title: "手動訂正総合テスト",
+            source: .microphone,
+            projectIds: ws.projectService.projects.map(\.id)
+        )
+        let tr = try ws.sttService.createTranscriptSession(
+            for: rec,
+            sttModelId: "stt-qwen3-asr-0.6b",
+            correctionMode: .off
+        )
+        let config = ws.modelManager.resolveConfiguration(project: ws.projectService.projects.first)
+
+        // 1. 補正オフでセグメントを登録
+        let rawInput = "ローカルエーアイのモデルをロードしてテストします。"
+        let segment = try await ws.sttService.processRealtimeUtteranceChunk(
+            transcriptId: tr.id,
+            rawUtteranceText: rawInput,
+            startTimeSeconds: 0,
+            endTimeSeconds: 4,
+            sttModel: config.realtimeSTTModel,
+            correctionMode: .off,
+            vocabularies: [],
+            judgeModel: config.judgeModel,
+            llmModel: config.llmModel
+        )
+        #expect(segment.rawText == rawInput)
+        #expect(segment.correctedText == rawInput)
+        #expect(!segment.hasCorrection)
+
+        // 2. ユーザーによる手動訂正
+        let manualCorrectedText = "ローカルAIのモデルをロードしてテストします。"
+        ws.updateTranscriptSegmentText(
+            transcriptId: tr.id,
+            segmentId: segment.id,
+            newText: manualCorrectedText
+        )
+
+        let updatedSeg = try #require(ws.sttService.segments(for: tr.id).first(where: { $0.id == segment.id }))
+        #expect(updatedSeg.rawText == rawInput) // 原文は絶対に上書きされない
+        #expect(updatedSeg.correctedText == manualCorrectedText)
+        #expect(updatedSeg.hasCorrection)
+
+        // リビジョン履歴に .manual として保存されていること
+        let revs = ws.correctionService.revisions(for: segment.id)
+        #expect(!revs.isEmpty)
+        let latestRev = try #require(revs.first)
+        #expect(latestRev.correctionMethod == .manual)
+        #expect(latestRev.sttRawText == rawInput)
+        #expect(latestRev.correctedText == manualCorrectedText)
+        #expect(latestRev.correctionSpans.first?.reason == "手動訂正")
+
+        // 3. 手動訂正結果で原文と同じテキストに戻した場合は自動的にロールバック扱いになること
+        ws.updateTranscriptSegmentText(
+            transcriptId: tr.id,
+            segmentId: segment.id,
+            newText: rawInput
+        )
+        let restoredSeg = try #require(ws.sttService.segments(for: tr.id).first(where: { $0.id == segment.id }))
+        #expect(restoredSeg.correctedText == rawInput)
+        #expect(!restoredSeg.hasCorrection)
+
+        // 4. 再度手動訂正を行い、ロールバックボタンで取り消せること
+        ws.updateTranscriptSegmentText(
+            transcriptId: tr.id,
+            segmentId: segment.id,
+            newText: "ローカルAIモデル (Qwen3) を検証します。"
+        )
+        let reEditedSeg = try #require(ws.sttService.segments(for: tr.id).first(where: { $0.id == segment.id }))
+        #expect(reEditedSeg.correctedText == "ローカルAIモデル (Qwen3) を検証します。")
+        #expect(reEditedSeg.hasCorrection)
+
+        ws.revertTranscriptSegmentCorrection(transcriptId: tr.id, segmentId: segment.id)
+        let rolledBackSeg = try #require(ws.sttService.segments(for: tr.id).first(where: { $0.id == segment.id }))
+        #expect(rolledBackSeg.correctedText == rawInput)
+        #expect(!rolledBackSeg.hasCorrection)
     }
 }

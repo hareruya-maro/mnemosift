@@ -272,4 +272,22 @@ public final class STTService {
         list[idx] = reverted
         segmentsByTranscriptId[transcriptId] = list
     }
+
+    /// 発話セグメントに対して手動訂正を適用する
+    @discardableResult
+    public func updateSegmentManualCorrection(
+        transcriptId: UUID,
+        segmentId: UUID,
+        correctedText: String
+    ) throws -> TranscriptSegment? {
+        guard var list = segmentsByTranscriptId[transcriptId],
+              let idx = list.firstIndex(where: { $0.id == segmentId }) else { return nil }
+        let (updated, _) = try correctionService.applyManualCorrection(
+            segment: list[idx],
+            correctedText: correctedText
+        )
+        list[idx] = updated
+        segmentsByTranscriptId[transcriptId] = list
+        return updated
+    }
 }

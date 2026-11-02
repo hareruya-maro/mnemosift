@@ -24,6 +24,8 @@ public struct MeetingPartnerView: View {
     @State private var simulatedUtteranceInput: String = "ネモシフトの検索にはエフティーエスファイブとエンベディングジェマ2を組み合わせる方針で決定します。"
     @State private var selectedTemplateId: String = "template-standard"
     @State private var editableMinutesMarkdown: String = ""
+    @State private var editingSegmentId: UUID?
+    @State private var editingSegmentText: String = ""
 
     public init(workspace: AppWorkspaceController) {
         self.workspace = workspace
@@ -344,7 +346,7 @@ public struct MeetingPartnerView: View {
 
     private var aiCorrectionPickerView: some View {
         Picker("AI補正", selection: $selectedCorrectionMode) {
-            ForEach(RealtimeCorrectionMode.allCases) { mode in
+            ForEach(RealtimeCorrectionMode.automaticModes) { mode in
                 Text(mode.displayName).tag(mode)
             }
         }
@@ -422,6 +424,10 @@ public struct MeetingPartnerView: View {
 
     private func transcriptUtteranceBubble(_ segment: TranscriptSegment) -> some View {
         let isHighlighted = workspace.highlightedSegmentId == segment.id
+        let isEditing = editingSegmentId == segment.id
+        let revisions = workspace.correctionService.revisions(for: segment.id)
+        let isManualCorrected = revisions.first?.correctionMethod == .manual
+
         return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
                 Text(segment.speakerLabel)
@@ -434,7 +440,11 @@ public struct MeetingPartnerView: View {
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
 
-                if segment.hasCorrection {
+                if isManualCorrected {
+                    Label("手動訂正済", systemImage: "pencil.line")
+                        .font(.caption2.bold())
+                        .foregroundStyle(.orange)
+                } else if segment.hasCorrection {
                     Label("用語・文脈補正済", systemImage: "sparkles")
                         .font(.caption2)
                         .foregroundStyle(.green)
@@ -442,19 +452,60 @@ public struct MeetingPartnerView: View {
 
                 Spacer()
 
-                if segment.hasCorrection, let tr = currentTranscript {
-                    Button("原文に戻す", systemImage: "arrow.uturn.backward") {
-                        try? workspace.sttService.revertCorrection(transcriptId: tr.id, segmentId: segment.id)
-                        workspace.refreshMeetingPartnerState()
+                if let tr = currentTranscript {
+                    if !isEditing {
+                        Button("手動訂正", systemImage: "pencil") {
+                            editingSegmentId = segment.id
+                            editingSegmentText = segment.correctedText
+                        }
+                        .controlSize(.mini)
+                        .buttonStyle(.bordered)
                     }
-                    .controlSize(.mini)
-                    .buttonStyle(.bordered)
+
+                    if segment.hasCorrection {
+                        Button("原文に戻す", systemImage: "arrow.uturn.backward") {
+                            workspace.revertTranscriptSegmentCorrection(transcriptId: tr.id, segmentId: segment.id)
+                        }
+                        .controlSize(.mini)
+                        .buttonStyle(.bordered)
+                    }
                 }
             }
 
-            Text(segment.correctedText)
-                .font(.body)
-                .textSelection(.enabled)
+            if isEditing, let tr = currentTranscript {
+                VStack(alignment: .leading, spacing: 6) {
+                    TextField("文字起こし結果を手動訂正", text: $editingSegmentText)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit {
+                            workspace.updateTranscriptSegmentText(transcriptId: tr.id, segmentId: segment.id, newText: editingSegmentText)
+                            editingSegmentId = nil
+                        }
+
+                    HStack(spacing: 8) {
+                        Button("保存", systemImage: "checkmark") {
+                            workspace.updateTranscriptSegmentText(transcriptId: tr.id, segmentId: segment.id, newText: editingSegmentText)
+                            editingSegmentId = nil
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+
+                        Button("キャンセル", systemImage: "xmark") {
+                            editingSegmentId = nil
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+
+                        Text("Returnキーで保存")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.vertical, 2)
+            } else {
+                Text(segment.correctedText)
+                    .font(.body)
+                    .textSelection(.enabled)
+            }
 
             if showRawDiffInline && segment.hasCorrection {
                 Text("STT原文: \(segment.rawText)")

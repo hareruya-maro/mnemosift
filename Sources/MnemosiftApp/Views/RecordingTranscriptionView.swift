@@ -19,6 +19,8 @@ public struct RecordingTranscriptionView: View {
     @State private var simulatedUtteranceInput: String = "ネモシフトではキュウエン・エーエスアールとジェマフォーをローカル実行します。"
     @State private var speakerInput: String = "話者A"
     @State private var runtimeHotwordsInput: String = ""
+    @State private var editingSegmentId: UUID?
+    @State private var editingSegmentText: String = ""
 
     public init(workspace: AppWorkspaceController) {
         self.workspace = workspace
@@ -151,7 +153,7 @@ public struct RecordingTranscriptionView: View {
             }
 
             Picker("リアルタイム補正モード", selection: $selectedCorrectionMode) {
-                ForEach(RealtimeCorrectionMode.allCases) { mode in
+                ForEach(RealtimeCorrectionMode.automaticModes) { mode in
                     Text(mode.displayName).tag(mode)
                 }
             }
@@ -334,6 +336,8 @@ public struct RecordingTranscriptionView: View {
     private func segmentCard(_ segment: TranscriptSegment) -> some View {
         let revisions = workspace.correctionService.revisions(for: segment.id)
         let isHighlighted = workspace.highlightedSegmentId == segment.id
+        let isEditing = editingSegmentId == segment.id
+        let isManual = revisions.first?.correctionMethod == .manual
 
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -346,7 +350,14 @@ public struct RecordingTranscriptionView: View {
                     .padding(.vertical, 2)
                     .background(.blue.opacity(0.15), in: Capsule())
 
-                if segment.hasCorrection {
+                if isManual {
+                    Text("手動訂正済み")
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 2)
+                        .background(.orange.opacity(0.18), in: Capsule())
+                        .foregroundStyle(.orange)
+                } else if segment.hasCorrection {
                     Text("AI補正適用済み")
                         .font(.caption2.bold())
                         .padding(.horizontal, 8)
@@ -361,16 +372,67 @@ public struct RecordingTranscriptionView: View {
 
                 Spacer()
 
-                if segment.hasCorrection, let activeTr = currentTranscript {
-                    Button("誤補正を取り消す（原文へ戻す）", systemImage: "arrow.uturn.backward") {
-                        try? workspace.sttService.revertCorrection(transcriptId: activeTr.id, segmentId: segment.id)
+                if let activeTr = currentTranscript {
+                    if !isEditing {
+                        Button("手動訂正", systemImage: "pencil") {
+                            editingSegmentId = segment.id
+                            editingSegmentText = segment.correctedText
+                        }
+                        .controlSize(.mini)
+                        .buttonStyle(.bordered)
                     }
-                    .controlSize(.mini)
-                    .buttonStyle(.bordered)
+
+                    if segment.hasCorrection {
+                        Button("訂正・補正を取り消す（原文へ戻す）", systemImage: "arrow.uturn.backward") {
+                            workspace.revertTranscriptSegmentCorrection(transcriptId: activeTr.id, segmentId: segment.id)
+                        }
+                        .controlSize(.mini)
+                        .buttonStyle(.bordered)
+                    }
                 }
             }
 
-            if showComparisonMode && segment.hasCorrection {
+            if isEditing {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("文字起こしの手動訂正（STT原文は保護されます）")
+                            .font(.caption2.bold())
+                            .foregroundStyle(.orange)
+                        Spacer()
+                        Text("STT原文: \(segment.rawText)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+
+                    TextField("訂正後のテキストを入力", text: $editingSegmentText, axis: .vertical)
+                        .textFieldStyle(.roundedBorder)
+                        .lineLimit(1...5)
+                        .onSubmit {
+                            saveManualCorrection(segment: segment)
+                        }
+
+                    HStack(spacing: 8) {
+                        Button("保存して反映", systemImage: "checkmark") {
+                            saveManualCorrection(segment: segment)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+
+                        Button("キャンセル", systemImage: "xmark") {
+                            editingSegmentId = nil
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+
+                        Text("Returnキーまたは「保存して反映」で確定")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(10)
+                .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            } else if showComparisonMode && segment.hasCorrection {
                 HStack(alignment: .top, spacing: 12) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("STT原文（変更不可・保護済み）")
@@ -379,31 +441,48 @@ public struct RecordingTranscriptionView: View {
                         Text(segment.rawText)
                             .font(.callout)
                             .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
                     }
                     .padding(10)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
 
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("補正後テキスト")
+                        Text(isManual ? "手動訂正後テキスト" : "補正後テキスト")
                             .font(.caption2.bold())
-                            .foregroundStyle(.green)
+                            .foregroundStyle(isManual ? .orange : .green)
                         Text(segment.correctedText)
                             .font(.callout.bold())
+                            .textSelection(.enabled)
                     }
                     .padding(10)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                    .background(
+                        (isManual ? Color.orange : Color.green).opacity(0.08),
+                        in: RoundedRectangle(cornerRadius: 8)
+                    )
+                }
+                .onTapGesture(count: 2) {
+                    editingSegmentId = segment.id
+                    editingSegmentText = segment.correctedText
                 }
             } else {
                 Text(segment.correctedText)
                     .font(.body)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                    .onTapGesture(count: 2) {
+                        editingSegmentId = segment.id
+                        editingSegmentText = segment.correctedText
+                    }
             }
 
             if let latestRev = revisions.first, !latestRev.correctionSpans.isEmpty {
                 VStack(alignment: .leading, spacing: 2) {
                     ForEach(Array(latestRev.correctionSpans.enumerated()), id: \.offset) { _, span in
-                        Text("・補正履歴: 『\(span.originalFragment)』→『\(span.correctedFragment)』(\(span.reason) / 確信度 \(Int(span.confidence * 100))%)")
+                        let prefix = latestRev.correctionMethod == .manual ? "・手動訂正履歴" : "・補正履歴"
+                        Text("\(prefix): 『\(span.originalFragment)』→『\(span.correctedFragment)』(\(span.reason) / 確信度 \(Int(span.confidence * 100))%)")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -415,6 +494,16 @@ public struct RecordingTranscriptionView: View {
             isHighlighted ? Color.yellow.opacity(0.18) : Color.secondary.opacity(0.06),
             in: RoundedRectangle(cornerRadius: 10)
         )
+    }
+
+    private func saveManualCorrection(segment: TranscriptSegment) {
+        guard let activeTr = currentTranscript else { return }
+        workspace.updateTranscriptSegmentText(
+            transcriptId: activeTr.id,
+            segmentId: segment.id,
+            newText: editingSegmentText
+        )
+        editingSegmentId = nil
     }
 
     // MARK: - Actions

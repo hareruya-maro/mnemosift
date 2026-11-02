@@ -157,7 +157,7 @@ public struct SettingsView: View {
                             try? workspace.modelManager.updateGlobalSettings(s)
                         }
                     )) {
-                        ForEach(RealtimeCorrectionMode.allCases) { mode in
+                        ForEach(RealtimeCorrectionMode.automaticModes) { mode in
                             Text(mode.displayName).tag(mode)
                         }
                     }

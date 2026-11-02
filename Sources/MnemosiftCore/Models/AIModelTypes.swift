@@ -108,6 +108,7 @@ public enum RealtimeCorrectionMode: String, Codable, CaseIterable, Sendable, Ide
     case dictionary = "dictionary"
     case fastAI = "fastAI"
     case highPrecisionAI = "highPrecisionAI"
+    case manual = "manual"
 
     public var id: String { rawValue }
 
@@ -117,6 +118,7 @@ public enum RealtimeCorrectionMode: String, Codable, CaseIterable, Sendable, Ide
         case .dictionary: "モード2：辞書補正"
         case .fastAI: "モード3：高速AI補正（推奨）"
         case .highPrecisionAI: "モード4：高精度AI補正（LLM）"
+        case .manual: "手動訂正"
         }
     }
 
@@ -126,7 +128,13 @@ public enum RealtimeCorrectionMode: String, Codable, CaseIterable, Sendable, Ide
         case .dictionary: "登録済み用語と明確な表記揺れのみを高速置換（LLM不使用）"
         case .fastAI: "辞書候補を小型判断モデルで文脈評価し、確信度が高い場合のみ補正"
         case .highPrecisionAI: "LLMとプロジェクト資料・文脈を用いて高精度に補正（高負荷）"
+        case .manual: "ユーザーによる直接入力・手動訂正"
         }
+    }
+
+    /// リアルタイム録音・設定画面で選択可能な自動補正モード一覧
+    public static var automaticModes: [RealtimeCorrectionMode] {
+        [.off, .dictionary, .fastAI, .highPrecisionAI]
     }
 }
 
